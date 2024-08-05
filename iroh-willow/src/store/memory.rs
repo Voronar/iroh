@@ -85,6 +85,19 @@ impl traits::SecretStorage for Rc<RefCell<SecretStore>> {
     fn get_namespace(&self, id: &NamespaceId) -> Option<NamespaceSecretKey> {
         self.borrow().namespace.get(id).cloned()
     }
+
+    fn list_users(&self) -> Vec<UserId> {
+        self.borrow().user.iter().map(|(k, _)| k).cloned().collect()
+    }
+
+    fn list_namespaces(&self) -> Vec<NamespaceId> {
+        self.borrow()
+            .namespace
+            .iter()
+            .map(|(k, _)| k)
+            .cloned()
+            .collect()
+    }
 }
 
 #[derive(Debug, Default)]

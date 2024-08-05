@@ -27,7 +27,9 @@ pub trait Storage: Debug + Clone + 'static {
 pub trait SecretStorage: Debug + Clone + 'static {
     fn insert(&self, secret: meadowcap::SecretKey) -> Result<(), SecretStoreError>;
     fn get_user(&self, id: &UserId) -> Option<UserSecretKey>;
+    fn list_users(&self) -> Vec<UserId>;
     fn get_namespace(&self, id: &NamespaceId) -> Option<NamespaceSecretKey>;
+    fn list_namespaces(&self) -> Vec<NamespaceId>;
 
     fn has_user(&self, id: &UserId) -> bool {
         self.get_user(id).is_some()

@@ -475,13 +475,22 @@ mod tests {
 
         info!(time=?start.elapsed(), "reconciliation finished");
 
-        let alfie_entries = get_entries(&handle_alfie, namespace_id).await?;
+        let mut alfie_entries = get_entries(&handle_alfie, namespace_id).await?;
         let betty_entries = get_entries(&handle_betty, namespace_id).await?;
         info!("alfie has now {} entries", alfie_entries.len());
         info!("betty has now {} entries", betty_entries.len());
         // not using assert_eq because it would print a lot in case of failure
         assert!(alfie_entries == expected_entries, "alfie expected entries");
         assert!(betty_entries == expected_entries, "betty expected entries");
+
+        let entry = alfie_entries.pop_first().unwrap();
+
+        let bytes = handle_alfie.read_payload(entry).await.unwrap().unwrap();
+        let s = String::from_utf8(bytes.to_vec()).unwrap();
+
+        println!("alfie first entry payload: {s}");
+
+        assert_eq!("betty0", &s);
 
         Ok(())
     }

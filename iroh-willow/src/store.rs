@@ -1,4 +1,6 @@
 use anyhow::{anyhow, Result};
+use bytes::Bytes;
+use iroh_blobs::store::{bao_tree::io::fsm::AsyncSliceReader, Map, MapEntry};
 use rand_core::CryptoRngCore;
 
 use crate::{
@@ -49,6 +51,21 @@ impl<S: Storage> Store<S> {
 
     pub fn payloads(&self) -> &S::Payloads {
         &self.payloads
+    }
+
+    pub async fn read_entry_payload(&self, entry: &Entry) -> Result<Option<Bytes>> {
+        let blob_entry = self.payloads().get(&entry.payload_digest).await?;
+
+        let res = if let Some(blob_entry) = blob_entry {
+            let mut reader = blob_entry.data_reader().await?;
+            let data = reader.read_at(0, entry.payload_length.try_into()?).await?;
+
+            Some(data)
+        } else {
+            None
+        };
+
+        Ok(res)
     }
 
     pub fn auth(&self) -> &Auth<S> {

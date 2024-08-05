@@ -1,6 +1,7 @@
 use std::{sync::Arc, thread::JoinHandle};
 
 use anyhow::Result;
+use bytes::Bytes;
 use futures_lite::stream::Stream;
 use iroh_base::key::NodeId;
 use tokio::{
@@ -169,6 +170,24 @@ impl ActorHandle {
         reply_rx.await?
     }
 
+    pub async fn list_users(&self) -> Result<Vec<UserId>> {
+        let (reply, reply_rx) = oneshot::channel();
+        self.send(Input::ListUsers { reply }).await?;
+        Ok(reply_rx.await?)
+    }
+
+    pub async fn list_namespaces(&self) -> Result<Vec<NamespaceId>> {
+        let (reply, reply_rx) = oneshot::channel();
+        self.send(Input::ListNamespaces { reply }).await?;
+        Ok(reply_rx.await?)
+    }
+
+    pub async fn read_payload(&self, entry: Entry) -> Result<Option<Bytes>> {
+        let (reply, reply_rx) = oneshot::channel();
+        self.send(Input::ReadEntryPayload { entry, reply }).await?;
+        Ok(reply_rx.await??)
+    }
+
     pub async fn delegate_caps(
         &self,
         from: CapSelector,
@@ -255,6 +274,16 @@ pub enum Input {
     },
     CreateUser {
         reply: oneshot::Sender<Result<UserId>>,
+    },
+    ListUsers {
+        reply: oneshot::Sender<Vec<UserId>>,
+    },
+    ListNamespaces {
+        reply: oneshot::Sender<Vec<NamespaceId>>,
+    },
+    ReadEntryPayload {
+        entry: Entry,
+        reply: oneshot::Sender<Result<Option<Bytes>>>,
     },
     ImportCaps {
         caps: Vec<CapabilityPack>,
@@ -423,6 +452,18 @@ impl<S: Storage> Actor<S> {
                 let secret = UserSecretKey::generate(&mut rand::thread_rng());
                 let res = self.store.secrets().insert_user(secret);
                 send_reply(reply, res.map_err(anyhow::Error::from))
+            }
+            Input::ListUsers { reply } => {
+                let res = self.store.secrets().list_users();
+                send_reply(reply, res)
+            }
+            Input::ListNamespaces { reply } => {
+                let res = self.store.secrets().list_namespaces();
+                send_reply(reply, res)
+            }
+            Input::ReadEntryPayload { reply, entry } => {
+                let res = self.store.read_entry_payload(&entry).await;
+                send_reply(reply, res)
             }
             Input::ImportCaps { caps, reply } => {
                 let res = self.store.auth().import_caps(caps);
