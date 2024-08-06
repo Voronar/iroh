@@ -19,6 +19,7 @@ use crate::{
         grouping::ThreeDRange,
         keys::{NamespaceId, NamespaceKind, UserId, UserSecretKey},
         meadowcap::{self, AccessMode},
+        sync::ReadAuthorisation,
         willow::{AuthorisedEntry, Entry},
     },
     session::{intents::Intent, run_session, Error, EventSender, Interests, SessionHandle},
@@ -212,6 +213,12 @@ impl ActorHandle {
         reply_rx.await?
     }
 
+    pub async fn list_read_caps(&self) -> Result<Vec<ReadAuthorisation>> {
+        let (reply, reply_rx) = oneshot::channel();
+        self.send(Input::ListReadCaps { reply }).await?;
+        reply_rx.await?
+    }
+
     pub async fn resolve_interests(&self, interests: Interests) -> Result<InterestMap> {
         let (reply, reply_rx) = oneshot::channel();
         self.send(Input::ResolveInterests { interests, reply })
@@ -288,6 +295,9 @@ pub enum Input {
     ImportCaps {
         caps: Vec<CapabilityPack>,
         reply: oneshot::Sender<Result<()>>,
+    },
+    ListReadCaps {
+        reply: oneshot::Sender<Result<Vec<ReadAuthorisation>>>,
     },
     ResolveInterests {
         interests: Interests,
@@ -467,6 +477,15 @@ impl<S: Storage> Actor<S> {
             }
             Input::ImportCaps { caps, reply } => {
                 let res = self.store.auth().import_caps(caps);
+                send_reply(reply, res.map_err(anyhow::Error::from))
+            }
+            Input::ListReadCaps { reply } => {
+                let res = self
+                    .store
+                    .auth()
+                    .list_read_caps()
+                    .map(|it| it.collect::<Vec<_>>());
+
                 send_reply(reply, res.map_err(anyhow::Error::from))
             }
             Input::DelegateCaps {
