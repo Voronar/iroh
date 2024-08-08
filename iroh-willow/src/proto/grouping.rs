@@ -404,7 +404,9 @@ impl Area {
             SubspaceArea::Id(id) => subspace_range_end(id),
         };
         let path_start = self.path.clone();
-        let path_end = path_range_end(&self.path);
+        // TODO maybe `path_range_end` implementation is wrong, a better one is here https://github.com/earthstar-project/willow-rs/pull/22
+        // let path_end = path_range_end(&self.path);
+        let path_end = RangeEnd::Open;
         ThreeDRange {
             subspaces: Range::new(subspace_start, subspace_end),
             paths: Range::new(path_start, path_end),
