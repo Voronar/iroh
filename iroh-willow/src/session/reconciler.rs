@@ -29,9 +29,10 @@ use crate::{
         grouping::{AreaOfInterest, ThreeDRange},
         keys::NamespaceId,
         sync::{
-            AreaOfInterestHandle, Fingerprint, LengthyEntry, ReconciliationAnnounceEntries,
-            ReconciliationMessage, ReconciliationSendEntry, ReconciliationSendFingerprint,
-            ReconciliationSendPayload, ReconciliationTerminatePayload,
+            AreaOfInterestHandle, Fingerprint, IsHandle, LengthyEntry,
+            ReconciliationAnnounceEntries, ReconciliationMessage, ReconciliationSendEntry,
+            ReconciliationSendFingerprint, ReconciliationSendPayload,
+            ReconciliationTerminatePayload,
         },
         willow::PayloadDigest,
     },
@@ -116,11 +117,17 @@ impl<S: Storage> Reconciler<S> {
     async fn received_message(&mut self, message: ReconciliationMessage) -> Result<(), Error> {
         match message {
             ReconciliationMessage::SendFingerprint(message) => {
-                self.targets
-                    .get_eventually(&self.shared, &message.handles())
-                    .await?
+                let target_id = message.handles();
+                let target = self
+                    .targets
+                    .get_eventually(&self.shared, &target_id)
+                    .await?;
+                target
                     .received_send_fingerprint(&self.shared, message)
                     .await?;
+                if target.is_complete() && self.current_entry.is_none() {
+                    self.complete_target(target_id).await?;
+                }
             }
             ReconciliationMessage::AnnounceEntries(message) => {
                 let target_id = message.handles();
@@ -188,6 +195,11 @@ impl<S: Storage> Reconciler<S> {
             .map
             .remove(&id)
             .ok_or(Error::InvalidMessageInCurrentState)?;
+        debug!(
+            our_handle = id.0.value(),
+            their_handle = id.1.value(),
+            "reconciled area"
+        );
         self.out(Output::ReconciledArea {
             area: target.intersection.intersection.clone(),
             namespace: target.namespace(),
@@ -256,7 +268,11 @@ impl<S: Storage> TargetMap<S> {
         let snapshot = shared.store.entries().snapshot()?;
         let target = Target::init(snapshot, shared, intersection).await?;
         let id = target.id();
-        tracing::info!("init {id:?}");
+        debug!(
+            our_handle = id.0.value(),
+            their_handle = id.1.value(),
+            "init area"
+        );
         self.map.insert(id, target);
         Ok(id)
     }
@@ -409,6 +425,7 @@ impl<S: Storage> Target<S> {
         shared: &Shared<S>,
         message: ReconciliationSendFingerprint,
     ) -> Result<(), Error> {
+        self.started = true;
         if let Some(range_count) = message.covers {
             self.mark_our_range_covered(range_count)?;
         }
@@ -476,6 +493,8 @@ impl<S: Storage> Target<S> {
         shared: &Shared<S>,
         message: ReconciliationAnnounceEntries,
     ) -> Result<(), Error> {
+        trace!(?message, "received_announce_entries start");
+        self.started = true;
         if let Some(range_count) = message.covers {
             self.mark_our_range_covered(range_count)?;
         }
@@ -577,7 +596,6 @@ impl<S: Storage> Target<S> {
 
     fn mark_our_next_range_pending(&mut self) {
         let range_count = self.next_range_count_ours();
-        self.started = true;
         self.our_uncovered_ranges.insert(range_count);
     }
 

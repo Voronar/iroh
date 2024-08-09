@@ -1,6 +1,7 @@
 //! Implementation of willow
 
 #![allow(missing_docs)]
+#![deny(unsafe_code)]
 
 pub mod auth;
 pub mod engine;

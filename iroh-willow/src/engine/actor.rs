@@ -14,7 +14,7 @@ use tracing::{debug, error, error_span, trace, warn, Instrument};
 use crate::{
     auth::{CapSelector, CapabilityPack, DelegateTo, InterestMap},
     form::{AuthForm, EntryForm, EntryOrForm},
-    net::WillowConn,
+    net::ConnHandle,
     proto::{
         grouping::ThreeDRange,
         keys::{NamespaceId, NamespaceKind, UserId, UserSecretKey},
@@ -51,9 +51,9 @@ impl ActorHandle {
     ) -> ActorHandle {
         let (inbox_tx, inbox_rx) = flume::bounded(INBOX_CAP);
         let join_handle = std::thread::Builder::new()
-            .name("willow-actor".to_string())
+            .name("willow".to_string())
             .spawn(move || {
-                let span = error_span!("willow-actor", me=%me.fmt_short());
+                let span = error_span!("willow", me=%me.fmt_short());
                 let _guard = span.enter();
                 let store = Store::new((create_store)());
                 let actor = Actor::new(store, inbox_rx);
@@ -137,9 +137,9 @@ impl ActorHandle {
         Ok(rx.into_stream())
     }
 
-    pub async fn init_session(
+    pub(crate) async fn init_session(
         &self,
-        conn: WillowConn,
+        conn: ConnHandle,
         intents: Vec<Intent>,
     ) -> Result<SessionHandle> {
         let (reply, reply_rx) = oneshot::channel();
@@ -250,7 +250,7 @@ impl Drop for ActorHandle {
 #[derive(derive_more::Debug, strum::Display)]
 pub enum Input {
     InitSession {
-        conn: WillowConn,
+        conn: ConnHandle,
         intents: Vec<Intent>,
         reply: oneshot::Sender<Result<SessionHandle>>,
     },

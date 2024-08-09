@@ -1,17 +1,18 @@
+use std::time::Duration;
 
 use anyhow::Result;
 use futures_concurrency::future::TryJoin;
 use futures_lite::StreamExt;
 
 use iroh_willow::{
-    proto::{
-        grouping::Area,
-        willow::Path,
+    proto::{grouping::Area, willow::Path},
+    session::{
+        intents::{Completion, EventKind},
+        Interests, SessionInit, SessionMode,
     },
-    session::{intents::EventKind, Interests, SessionInit, SessionMode},
 };
 
-use self::util::{create_rng, spawn_two, insert, setup_and_delegate, Peer};
+use self::util::{create_rng, insert, setup_and_delegate, spawn_two, Peer};
 
 #[tokio::test(flavor = "multi_thread")]
 async fn peer_manager_two_intents() -> Result<()> {
@@ -110,6 +111,8 @@ async fn peer_manager_two_intents() -> Result<()> {
     task_foo_path.await.unwrap();
     task_bar_path.await.unwrap();
 
+    // tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+
     [alfie, betty].map(Peer::shutdown).try_join().await?;
 
     Ok(())
@@ -184,6 +187,85 @@ async fn peer_manager_update_intent() -> Result<()> {
     Ok(())
 }
 
+/// Test immediate shutdown.
+// TODO: This does not really test much. Used it for log reading of graceful connection termination.
+// Not sure where we should expose whether connections closed gracefully or not?
+#[tokio::test(flavor = "multi_thread")]
+async fn peer_manager_shutdown_immediate() -> Result<()> {
+    iroh_test::logging::setup_multithreaded();
+    let mut rng = create_rng("peer_manager_shutdown_immediate");
+
+    let [alfie, betty] = spawn_two(&mut rng).await?;
+    let (_namespace, _alfie_user, _betty_user) = setup_and_delegate(&alfie, &betty).await?;
+    let betty_node_id = betty.node_id();
+    let mut intent = alfie
+        .sync_with_peer(betty_node_id, SessionInit::reconcile_once(Interests::all()))
+        .await?;
+    let completion = intent.complete().await?;
+    assert_eq!(completion, Completion::Complete);
+    [alfie, betty].map(Peer::shutdown).try_join().await?;
+    Ok(())
+}
+
+/// Test shutdown after a timeout.
+// TODO: This does not really test much. Used it for log reading of graceful connection termination.
+// Not sure where we should expose whether connections closed gracefully or not?
+#[tokio::test(flavor = "multi_thread")]
+async fn peer_manager_shutdown_timeout() -> Result<()> {
+    iroh_test::logging::setup_multithreaded();
+    let mut rng = create_rng("peer_manager_shutdown_timeout");
+
+    let [alfie, betty] = spawn_two(&mut rng).await?;
+    let (_namespace, _alfie_user, _betty_user) = setup_and_delegate(&alfie, &betty).await?;
+    let betty_node_id = betty.node_id();
+    let mut intent = alfie
+        .sync_with_peer(betty_node_id, SessionInit::reconcile_once(Interests::all()))
+        .await?;
+    let completion = intent.complete().await?;
+    assert_eq!(completion, Completion::Complete);
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    [alfie, betty].map(Peer::shutdown).try_join().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn peer_manager_twoway_loop() -> Result<()> {
+    iroh_test::logging::setup_multithreaded();
+    let mut rng = create_rng("peer_manager_twoway_loop");
+
+    let [alfie, betty] = spawn_two(&mut rng).await?;
+    let (namespace, alfie_user, betty_user) = setup_and_delegate(&alfie, &betty).await?;
+    insert(&alfie, namespace, alfie_user, &[b"foo"], "foo 1").await?;
+    insert(&betty, namespace, betty_user, &[b"bar"], "bar 1").await?;
+    let alfie_node_id = alfie.node_id();
+    let betty_node_id = betty.node_id();
+    for _i in 0..20 {
+        let alfie = alfie.clone();
+        let betty = betty.clone();
+        let task_alfie = tokio::task::spawn(async move {
+            let mut intent = alfie
+                .sync_with_peer(betty_node_id, SessionInit::reconcile_once(Interests::all()))
+                .await
+                .unwrap();
+            let completion = intent.complete().await.expect("failed to complete intent");
+            assert_eq!(completion, Completion::Complete);
+        });
+
+        let task_betty = tokio::task::spawn(async move {
+            let mut intent = betty
+                .sync_with_peer(alfie_node_id, SessionInit::reconcile_once(Interests::all()))
+                .await
+                .unwrap();
+            let completion = intent.complete().await.expect("failed to complete intent");
+            assert_eq!(completion, Completion::Complete);
+        });
+        task_alfie.await.unwrap();
+        task_betty.await.unwrap();
+    }
+    [alfie, betty].map(Peer::shutdown).try_join().await?;
+    Ok(())
+}
+
 mod util {
     use std::sync::{Arc, Mutex};
 
@@ -238,11 +320,15 @@ mod util {
                 let endpoint = endpoint.clone();
                 async move {
                     while let Some(mut conn) = endpoint.accept().await {
-                        let alpn = conn.alpn().await?;
+                        let Ok(alpn) = conn.alpn().await else {
+                            continue;
+                        };
                         if alpn != ALPN {
                             continue;
                         }
-                        let conn = conn.await?;
+                        let Ok(conn) = conn.await else {
+                            continue;
+                        };
                         engine.handle_connection(conn).await?;
                     }
                     Result::Ok(())

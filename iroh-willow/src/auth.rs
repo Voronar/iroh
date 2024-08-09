@@ -36,14 +36,14 @@ impl DelegateTo {
 #[derive(Debug, Clone)]
 pub enum RestrictArea {
     None,
-    Restrict(Area)
+    Restrict(Area),
 }
 
 impl RestrictArea {
     pub fn with_default(self, default: Area) -> Area {
         match self {
             RestrictArea::None => default.clone(),
-            RestrictArea::Restrict(area) => area
+            RestrictArea::Restrict(area) => area,
         }
     }
 }
@@ -146,7 +146,7 @@ pub enum AreaSelector {
     Widest,
     /// Use any capability that covers the provided area.
     ContainsArea(Area),
-    /// Use any capability that covers the provided point.
+    /// Use any capability that covers the provided point (i.e. entry).
     ContainsPoint(Point),
 }
 

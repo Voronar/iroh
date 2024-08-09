@@ -1,15 +1,15 @@
 use std::{future::Future, sync::Arc};
 
 use futures_concurrency::{future::TryJoin, stream::StreamExt as _};
-use futures_lite::{Stream, StreamExt as _};
+use futures_lite::StreamExt as _;
 use strum::IntoEnumIterator;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error_span, Instrument, Span};
+use tracing::{debug, error_span, trace, warn, Instrument, Span};
 
 use crate::{
-    net::WillowConn,
+    net::ConnHandle,
     proto::sync::{ControlIssueGuarantee, LogicalChannel, Message, SetupBindAreaOfInterest},
     session::{
         aoi_finder::{self, IntersectionFinder},
@@ -36,21 +36,20 @@ use super::{
 
 const INITIAL_GUARANTEES: u64 = u64::MAX;
 
-pub async fn run_session<S: Storage>(
+pub(crate) async fn run_session<S: Storage>(
     store: Store<S>,
-    conn: WillowConn,
+    conn: ConnHandle,
     initial_intents: Vec<Intent>,
     cancel_token: CancellationToken,
     session_id: SessionId,
     event_sender: EventSender,
-    update_receiver: impl Stream<Item = SessionUpdate> + Unpin + 'static,
+    update_receiver: ReceiverStream<SessionUpdate>,
 ) -> Result<(), Arc<Error>> {
-    let WillowConn {
+    let ConnHandle {
         peer: _,
         initial_transmission,
         our_role,
         channels,
-        join_handle,
     } = conn;
     let Channels {
         send: channel_sender,
@@ -116,25 +115,12 @@ pub async fn run_session<S: Storage>(
         (None, None)
     };
 
-    let net_fut = with_span(error_span!("net"), async {
-        // TODO: awaiting the net task handle hangs
-        drop(join_handle);
-        // let res = join_handle.await;
-        // debug!(?res, "net tasks finished");
-        // match res {
-        //     Ok(Ok(())) => Ok(()),
-        //     Ok(Err(err)) => Err(Error::Net(err)),
-        //     Err(err) => Err(Error::Net(err.into())),
-        // }
-        Ok(())
-    });
-
     let mut intents = intents::IntentDispatcher::new(store.auth().clone(), initial_intents);
     let intents_fut = with_span(error_span!("intents"), async {
         use intents::Output;
         let mut intents_gen = intents.run_gen(intents_inbox_rx);
         while let Some(output) = intents_gen.try_next().await? {
-            debug!(?output, "yield");
+            trace!(?output, "yield");
             match output {
                 Output::SubmitInterests(interests) => {
                     intersection_inbox
@@ -168,7 +154,7 @@ pub async fn run_session<S: Storage>(
                 while let Some(message) = data_recv.try_next().await? {
                     data_receiver.on_message(message).await?;
                 }
-                tracing::debug!("data receiver done");
+                trace!("data receiver terminated");
                 Ok(())
             };
             (send_fut, recv_fut).try_join().await?;
@@ -305,6 +291,8 @@ pub async fn run_session<S: Storage>(
         Ok(())
     });
 
+    let mut we_cancelled = false;
+
     let control_loop = with_span(error_span!("control"), async {
         let res = control_loop(
             control_recv,
@@ -316,8 +304,10 @@ pub async fn run_session<S: Storage>(
         )
         .await;
         if !cancel_token.is_cancelled() {
-            debug!("close session (control channel closed)");
+            debug!("close session (closed by peer)");
             cancel_token.cancel();
+        } else {
+            we_cancelled = true;
         }
         res
     });
@@ -342,7 +332,6 @@ pub async fn run_session<S: Storage>(
     });
 
     let result = (
-        net_fut,
         intents_fut,
         control_loop,
         data_loop,
@@ -357,36 +346,40 @@ pub async fn run_session<S: Storage>(
         .try_join()
         .await;
 
-    let result = match result {
-        Ok(_) => Ok(()),
-        Err(err) => Err(Arc::new(err)),
-    };
-
-    // Unsubscribe from the store.  This stops the data send task.
+    // Unsubscribe from the store.
     store.entries().unsubscribe(&session_id);
 
-    // Close our channel senders.
-    // This will stop the network send loop after all pending data has been sent.
-    channel_sender.close_all();
+    let result = result.map_err(Arc::new).map(|_| ());
 
-    event_sender
+    debug!(error=?result.as_ref().err(), ?we_cancelled, "session complete");
+
+    let remaining_intents = match result.as_ref() {
+        Ok(()) => {
+            // If the session closed without an error, return the remaining intents
+            // so that they can potentially be restarted.
+            intents.drain_all()
+        }
+        Err(err) => {
+            // If the session closed with error, abort the intents with that error.
+            intents.abort_all(err.clone()).await;
+            vec![]
+        }
+    };
+
+    if let Err(_receiver_dropped) = event_sender
         .send(SessionEvent::Complete {
             result: result.clone(),
+            we_cancelled,
+            senders: channel_sender,
+            remaining_intents,
+            update_receiver: update_receiver.into_inner().into_inner(),
         })
         .await
-        .ok();
-
-    match result {
-        Ok(_) => {
-            debug!("session complete");
-            Ok(())
-        }
-        Err(error) => {
-            debug!(?error, "session failed");
-            intents.abort_all(error.clone()).await;
-            Err(error)
-        }
+    {
+        warn!("failed to send session complete event: receiver dropped");
     }
+
+    result
 }
 
 async fn control_loop(
@@ -481,9 +474,9 @@ async fn with_span<T: std::fmt::Debug>(
     fut: impl Future<Output = Result<T, Error>>,
 ) -> Result<T, Error> {
     async {
-        tracing::debug!("start");
+        trace!("start");
         let res = fut.await;
-        tracing::debug!(?res, "done");
+        trace!(?res, "done");
         res
     }
     .instrument(span)

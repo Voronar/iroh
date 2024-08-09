@@ -3,6 +3,7 @@ use std::{
     sync::Arc,
 };
 
+use channels::ChannelSenders;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -25,9 +26,9 @@ mod resource;
 mod run;
 mod static_tokens;
 
-pub use self::channels::Channels;
-pub use self::error::Error;
-pub use self::run::run_session;
+pub(crate) use self::channels::Channels;
+pub(crate) use self::error::Error;
+pub(crate) use self::run::run_session;
 
 pub type SessionId = u64;
 
@@ -77,6 +78,10 @@ pub enum Interests {
 impl Interests {
     pub fn builder() -> SelectBuilder {
         SelectBuilder::default()
+    }
+
+    pub fn all() -> Self {
+        Self::All
     }
 }
 
@@ -176,10 +181,19 @@ impl EventSender {
     }
 }
 
-#[derive(Debug)]
+#[derive(derive_more::Debug)]
 pub enum SessionEvent {
     Established,
-    Complete { result: Result<(), Arc<Error>> },
+    Complete {
+        result: Result<(), Arc<Error>>,
+        // who_cancelled: WhoCancelled,
+        we_cancelled: bool,
+        #[debug("ChannelSenders")]
+        senders: ChannelSenders,
+        remaining_intents: Vec<Intent>,
+        #[debug("Receiver<SessionUpdate>")]
+        update_receiver: mpsc::Receiver<SessionUpdate>,
+    },
 }
 
 #[derive(Debug)]
@@ -192,14 +206,21 @@ pub struct SessionHandle {
 impl SessionHandle {
     /// Wait for the session to finish.
     ///
+    /// Returns the channel senders and a boolean indicating if we cancelled the session.
     /// Returns an error if the session failed to complete.
-    pub async fn complete(&mut self) -> Result<(), Arc<Error>> {
+    pub async fn complete(&mut self) -> Result<(ChannelSenders, bool), Arc<Error>> {
         while let Some(event) = self.event_rx.recv().await {
-            if let SessionEvent::Complete { result } = event {
-                return result;
+            if let SessionEvent::Complete {
+                result,
+                senders,
+                we_cancelled,
+                ..
+            } = event
+            {
+                return result.map(|()| (senders, we_cancelled));
             }
         }
-        Ok(())
+        Err(Arc::new(Error::ActorFailed))
     }
 
     /// Submit a new synchronisation intent.

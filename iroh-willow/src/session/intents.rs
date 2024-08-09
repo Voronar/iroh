@@ -14,7 +14,7 @@ use genawaiter::rc::Co;
 use tokio::sync::mpsc;
 use tokio_stream::{wrappers::ReceiverStream, StreamMap, StreamNotifyClose};
 use tokio_util::sync::PollSender;
-use tracing::debug;
+use tracing::{debug, trace, warn};
 
 use crate::{
     auth::{Auth, InterestMap},
@@ -144,7 +144,7 @@ impl Intent {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Eq, PartialEq)]
 pub enum Completion {
     /// All interests were reconciled.
     Complete,
@@ -231,7 +231,8 @@ impl Stream for IntentHandle {
     }
 }
 
-#[derive(Debug)]
+#[derive(derive_more::Debug)]
+#[debug("IntentChannels")]
 struct IntentChannels {
     event_tx: Sender<EventKind>,
     update_rx: Receiver<IntentUpdate>,
@@ -272,6 +273,7 @@ impl<S: Storage> IntentDispatcher<S> {
         }
     }
 
+    /// Aborts all registered intents.
     pub(super) async fn abort_all(&self, error: Arc<Error>) {
         let _ = futures_buffered::join_all(
             Iterator::chain(
@@ -291,6 +293,36 @@ impl<S: Storage> IntentDispatcher<S> {
         .await;
     }
 
+    /// Takes self and returns all pending intents.
+    // TODO: What if one of the two channels closed?
+    // Should not do Option<IntentChannels> but an option for each direction instead likely on Intent.
+    pub(super) fn drain_all(mut self) -> Vec<Intent> {
+        let mut intents: Vec<_> = self.pending_intents.into_iter().collect();
+        for (id, info) in self.intents.drain() {
+            let event_tx = info.event_tx;
+            let update_rx = self.intent_update_rx.remove(&id);
+            let update_rx = update_rx
+                .map(|stream| stream.into_inner())
+                .flatten()
+                .map(|stream| stream.into_inner());
+            let channels = match (event_tx, update_rx) {
+                (Some(event_tx), Some(update_rx)) => Some(IntentChannels {
+                    event_tx,
+                    update_rx,
+                }),
+                _ => None,
+            };
+            if let Some(channels) = channels {
+                let intent = Intent {
+                    init: info.original_init,
+                    channels: Some(channels),
+                };
+                intents.push(intent);
+            }
+        }
+        intents
+    }
+
     /// Run the [`IntentDispatcher`].
     ///
     /// The returned stream is a generator, so it must be polled repeatedly to progress.
@@ -307,11 +339,11 @@ impl<S: Storage> IntentDispatcher<S> {
         while let Some(intent) = self.pending_intents.pop_front() {
             self.submit_intent(&co, intent).await?;
         }
-        debug!("submitted initial intents, start loop");
+        trace!("submitted initial intents, start loop");
         loop {
             tokio::select! {
                 input = inbox.next() => {
-                    tracing::debug!(?input, "tick: inbox");
+                    trace!(?input, "tick: inbox");
                     let Some(input) = input else {
                         break;
                     };
@@ -321,12 +353,12 @@ impl<S: Storage> IntentDispatcher<S> {
                     }
                 }
                 Some((intent_id, event)) = self.intent_update_rx.next(), if !self.intent_update_rx.is_empty() => {
-                    tracing::debug!(?intent_id, ?event, "tick: intent_update");
+                    trace!(?intent_id, ?event, "tick: intent_update");
                     match event {
                         Some(event) => {
                             // Received an intent update.
                             if let Err(err) = self.update_intent(&co, intent_id, event).await {
-                                tracing::warn!(%intent_id, ?err, "failed to update intent");
+                                warn!(%intent_id, ?err, "failed to update intent");
                             }
                         },
                         None => {
@@ -346,7 +378,7 @@ impl<S: Storage> IntentDispatcher<S> {
     }
 
     async fn submit_intent(&mut self, co: &Co<Output>, intent: Intent) -> Result<(), Error> {
-        let interests = self.auth.resolve_interests(intent.init.interests)?;
+        let interests = self.auth.resolve_interests(intent.init.interests.clone())?;
         let intent_id = {
             let intent_id = self.next_intent_id;
             self.next_intent_id += 1;
@@ -364,6 +396,7 @@ impl<S: Storage> IntentDispatcher<S> {
             interests: flatten_interests(&interests),
             mode: intent.init.mode,
             event_tx,
+            original_init: intent.init,
         };
         // Send out reconciled events for already-complete areas.
         for (namespace, areas) in &self.complete_areas {
@@ -420,7 +453,7 @@ impl<S: Storage> IntentDispatcher<S> {
         intent_id: u64,
         update: IntentUpdate,
     ) -> Result<()> {
-        debug!(?intent_id, ?update, "intent update");
+        trace!(?intent_id, ?update, "intent update");
         match update {
             IntentUpdate::AddInterests(interests) => {
                 let add_interests = self.auth.resolve_interests(interests)?;
@@ -438,7 +471,7 @@ impl<S: Storage> IntentDispatcher<S> {
     }
 
     async fn cancel_intent(&mut self, co: &Co<Output>, intent_id: u64) {
-        debug!(?intent_id, "cancel intent");
+        trace!(?intent_id, "cancel intent");
         self.intent_update_rx.remove(&intent_id);
         self.intents.remove(&intent_id);
         if self.intents.is_empty() {
@@ -449,6 +482,7 @@ impl<S: Storage> IntentDispatcher<S> {
 
 #[derive(Debug)]
 pub(super) struct IntentInfo {
+    original_init: SessionInit,
     interests: NamespaceInterests,
     mode: SessionMode,
     event_tx: Option<Sender<EventKind>>,
