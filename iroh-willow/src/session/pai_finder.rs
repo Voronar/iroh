@@ -3,8 +3,10 @@
 //! As defined by the willow spec: [Private Area Intersection](https://willowprotocol.org/specs/pai/index.html)
 //!
 //! Partly ported from the implementation in earthstar and willow:
+//!
 //! * https://github.com/earthstar-project/willow-js/blob/0db4b9ec7710fb992ab75a17bd8557040d9a1062/src/wgps/pai/pai_finder.ts
 //! * https://github.com/earthstar-project/earthstar/blob/16d6d4028c22fdbb72f7395013b29be7dcd9217a/src/schemes/schemes.ts#L662
+//!
 //! Licensed under LGPL and ported into this MIT/Apache codebase with explicit permission
 //! from the original author (gwil).
 
@@ -17,17 +19,18 @@ use tracing::{debug, trace};
 
 use crate::{
     proto::{
-        grouping::SubspaceArea,
+        data_model::{NamespaceId, Path},
+        grouping::AreaSubspace,
+        meadowcap::{ReadAuthorisation, SubspaceCapability},
         pai::{Fragment, FragmentKind, FragmentSet, PaiScheme, PsiGroup, PsiScalar},
-        sync::{
+        wgps::{
             IntersectionHandle, IntersectionMessage, Message, PaiBindFragment, PaiReplyFragment,
-            PaiRequestSubspaceCapability, ReadAuthorisation, SubspaceCapability,
+            PaiRequestSubspaceCapability,
         },
-        willow::{NamespaceId, Path},
     },
     session::{
-        resource::{MissingResource, ResourceMap},
-        Error, Scope,
+        resource::{MissingResource, ResourceMap, Scope},
+        Error,
     },
     util::gen_stream::GenStream,
 };
@@ -387,7 +390,7 @@ pub struct LocalFragmentInfo {
     path: Path,
     // will be needed for spec-compliant encodings of read capabilities
     #[allow(dead_code)]
-    subspace: SubspaceArea,
+    subspace: AreaSubspace,
 }
 
 impl LocalFragmentInfo {
@@ -504,13 +507,14 @@ mod tests {
 
     use crate::{
         proto::{
-            grouping::{Area, SubspaceArea},
-            keys::{NamespaceKind, NamespaceSecretKey, UserPublicKey, UserSecretKey},
-            sync::{
+            data_model::{Path, PathExt},
+            grouping::{Area, AreaSubspace},
+            keys::{NamespaceKind, NamespaceSecretKey, UserId, UserSecretKey},
+            meadowcap::ReadAuthorisation,
+            wgps::{
                 IntersectionMessage, Message, PaiBindFragment, PaiReplyFragment,
-                PaiRequestSubspaceCapability, ReadAuthorisation,
+                PaiRequestSubspaceCapability,
             },
-            willow::Path,
         },
         session::{pai_finder::PaiIntersection, Error},
     };
@@ -529,8 +533,8 @@ mod tests {
         let (_, alfie_public) = keypair(&mut rng);
         let (_, betty_public) = keypair(&mut rng);
 
-        let auth_alfie = ReadAuthorisation::new_owned(&namespace_secret, alfie_public);
-        let auth_betty = ReadAuthorisation::new_owned(&namespace_secret, betty_public);
+        let auth_alfie = ReadAuthorisation::new_owned(&namespace_secret, alfie_public).unwrap();
+        let auth_betty = ReadAuthorisation::new_owned(&namespace_secret, betty_public).unwrap();
 
         let (alfie, betty) = Handle::create_two();
 
@@ -559,15 +563,15 @@ mod tests {
         let namespace = NamespaceSecretKey::generate(&mut rng, NamespaceKind::Owned);
 
         let (root_secret, root_public) = keypair(&mut rng);
-        let root_auth = ReadAuthorisation::new_owned(&namespace, root_public);
+        let root_auth = ReadAuthorisation::new_owned(&namespace, root_public).unwrap();
 
         let (_, alfie_public) = keypair(&mut rng);
         let (_, betty_public) = keypair(&mut rng);
         let (_, gemma_public) = keypair(&mut rng);
 
         let alfie_area = Area::new(
-            SubspaceArea::Id(gemma_public.id()),
-            Path::empty(),
+            AreaSubspace::Id(gemma_public),
+            Path::new_empty(),
             Default::default(),
         );
         let alfie_auth = root_auth
@@ -576,8 +580,8 @@ mod tests {
         assert!(alfie_auth.subspace_cap().is_none());
 
         let betty_area = Area::new(
-            SubspaceArea::Any,
-            Path::new(&[b"chess"]).unwrap(),
+            AreaSubspace::Any,
+            Path::from_bytes(&[b"chess"]).unwrap(),
             Default::default(),
         );
         let betty_auth = root_auth
@@ -613,9 +617,9 @@ mod tests {
         };
 
         assert_eq!(&cap, betty_auth.subspace_cap().unwrap());
-        let namespace = cap.granted_namespace().id();
+        let namespace = cap.granted_namespace();
         alfie
-            .input(Input::ReceivedVerifiedSubspaceCapReply(handle, namespace))
+            .input(Input::ReceivedVerifiedSubspaceCapReply(handle, *namespace))
             .await;
 
         let next = alfie.next_intersection().await;
@@ -631,10 +635,10 @@ mod tests {
         betty.join().await;
     }
 
-    fn keypair<R: CryptoRngCore + ?Sized>(rng: &mut R) -> (UserSecretKey, UserPublicKey) {
+    fn keypair<R: CryptoRngCore + ?Sized>(rng: &mut R) -> (UserSecretKey, UserId) {
         let secret = UserSecretKey::generate(rng);
         let public = secret.public_key();
-        (secret, public)
+        (secret, public.id())
     }
 
     async fn transfer<T: TryFrom<Message> + Into<IntersectionMessage>>(from: &Handle, to: &Handle) {

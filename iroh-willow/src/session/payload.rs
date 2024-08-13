@@ -7,7 +7,7 @@ use iroh_blobs::{
 };
 
 use crate::{
-    proto::{sync::Message, willow::PayloadDigest},
+    proto::{data_model::PayloadDigest, wgps::Message},
     session::channels::ChannelSenders,
 };
 
@@ -15,6 +15,12 @@ use super::Error;
 
 pub const DEFAULT_CHUNK_SIZE: usize = 1024 * 64;
 
+/// Send a payload in chunks.
+///
+/// Returns `true` if the payload was sent.
+/// Returns `false` if blob is not found in `payload_store`.
+/// Returns an error if the store or sending on the `senders` return an error.
+// TODO: Include outboards.
 pub async fn send_payload_chunked<P: PayloadStore>(
     digest: PayloadDigest,
     payload_store: &P,
@@ -23,7 +29,7 @@ pub async fn send_payload_chunked<P: PayloadStore>(
     map: impl Fn(Bytes) -> Message,
 ) -> Result<bool, Error> {
     let payload_entry = payload_store
-        .get(&digest)
+        .get(&digest.0)
         .await
         .map_err(Error::PayloadStore)?;
     if let Some(entry) = payload_entry {
@@ -129,7 +135,7 @@ impl CurrentPayload {
             .ok_or_else(|| Error::InvalidMessageInCurrentState)?;
         drop(writer.sender);
         let (tag, len) = writer.fut.await.map_err(Error::PayloadStore)?;
-        if *tag.hash() != state.payload_digest {
+        if *tag.hash() != state.payload_digest.0 {
             return Err(Error::PayloadDigestMismatch);
         }
         if len != state.expected_length {

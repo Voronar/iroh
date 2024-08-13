@@ -5,10 +5,14 @@ use futures_concurrency::future::TryJoin;
 use futures_lite::StreamExt;
 
 use iroh_willow::{
-    proto::{grouping::Area, willow::Path},
+    interest::{Interests, IntoAreaOfInterest},
+    proto::{
+        data_model::{Path, PathExt},
+        grouping::{Area, AreaExt},
+    },
     session::{
         intents::{Completion, EventKind},
-        Interests, SessionInit, SessionMode,
+        SessionInit, SessionMode,
     },
 };
 
@@ -30,10 +34,10 @@ async fn peer_manager_two_intents() -> Result<()> {
     let task_foo_path = tokio::task::spawn({
         let alfie = alfie.clone();
         async move {
-            let path = Path::new(&[b"foo"]).unwrap();
+            let path = Path::from_bytes(&[b"foo"]).unwrap();
 
             let init = SessionInit::new(
-                Interests::builder().add_area(namespace, [Area::path(path.clone())]),
+                Interests::builder().add_area(namespace, [Area::new_path(path.clone())]),
                 SessionMode::ReconcileOnce,
             );
             let mut intent = alfie.sync_with_peer(betty_node_id, init).await.unwrap();
@@ -42,7 +46,7 @@ async fn peer_manager_two_intents() -> Result<()> {
                 intent.next().await.unwrap(),
                 EventKind::CapabilityIntersection {
                     namespace,
-                    area: Area::full(),
+                    area: Area::new_full(),
                 }
             );
 
@@ -50,7 +54,7 @@ async fn peer_manager_two_intents() -> Result<()> {
                 intent.next().await.unwrap(),
                 EventKind::InterestIntersection {
                     namespace,
-                    area: Area::path(path.clone()).into()
+                    area: Area::new_path(path.clone()).into_area_of_interest()
                 }
             );
 
@@ -58,7 +62,7 @@ async fn peer_manager_two_intents() -> Result<()> {
                 intent.next().await.unwrap(),
                 EventKind::Reconciled {
                     namespace,
-                    area: Area::path(path.clone()).into()
+                    area: Area::new_path(path.clone()).into_area_of_interest()
                 }
             );
 
@@ -71,9 +75,10 @@ async fn peer_manager_two_intents() -> Result<()> {
     let task_bar_path = tokio::task::spawn({
         let alfie = alfie.clone();
         async move {
-            let path = Path::new(&[b"bar"]).unwrap();
+            let path = Path::from_bytes(&[b"bar"]).unwrap();
 
-            let interests = Interests::builder().add_area(namespace, [Area::path(path.clone())]);
+            let interests =
+                Interests::builder().add_area(namespace, [Area::new_path(path.clone())]);
             let init = SessionInit::new(interests, SessionMode::ReconcileOnce);
 
             let mut intent = alfie.sync_with_peer(betty_node_id, init).await.unwrap();
@@ -82,7 +87,7 @@ async fn peer_manager_two_intents() -> Result<()> {
                 intent.next().await.unwrap(),
                 EventKind::CapabilityIntersection {
                     namespace,
-                    area: Area::full(),
+                    area: Area::new_full(),
                 }
             );
 
@@ -90,7 +95,7 @@ async fn peer_manager_two_intents() -> Result<()> {
                 intent.next().await.unwrap(),
                 EventKind::InterestIntersection {
                     namespace,
-                    area: Area::path(path.clone()).into()
+                    area: Area::new_path(path.clone()).into_area_of_interest()
                 }
             );
 
@@ -98,7 +103,7 @@ async fn peer_manager_two_intents() -> Result<()> {
                 intent.next().await.unwrap(),
                 EventKind::Reconciled {
                     namespace,
-                    area: Area::path(path.clone()).into()
+                    area: Area::new_path(path.clone()).into_area_of_interest()
                 }
             );
 
@@ -130,50 +135,50 @@ async fn peer_manager_update_intent() -> Result<()> {
     insert(&betty, namespace, betty_user, &[b"foo"], "foo 1").await?;
     insert(&betty, namespace, betty_user, &[b"bar"], "bar 1").await?;
 
-    let path = Path::new(&[b"foo"]).unwrap();
-    let interests = Interests::builder().add_area(namespace, [Area::path(path.clone())]);
-    let init = SessionInit::new(interests, SessionMode::Live);
+    let path = Path::from_bytes(&[b"foo"]).unwrap();
+    let interests = Interests::builder().add_area(namespace, [Area::new_path(path.clone())]);
+    let init = SessionInit::new(interests, SessionMode::Continuous);
     let mut intent = alfie.sync_with_peer(betty_node_id, init).await.unwrap();
 
     assert_eq!(
         intent.next().await.unwrap(),
         EventKind::CapabilityIntersection {
             namespace,
-            area: Area::full(),
+            area: Area::new_full(),
         }
     );
     assert_eq!(
         intent.next().await.unwrap(),
         EventKind::InterestIntersection {
             namespace,
-            area: Area::path(path.clone()).into()
+            area: Area::new_path(path.clone()).into_area_of_interest()
         }
     );
     assert_eq!(
         intent.next().await.unwrap(),
         EventKind::Reconciled {
             namespace,
-            area: Area::path(path.clone()).into()
+            area: Area::new_path(path.clone()).into_area_of_interest()
         }
     );
     assert_eq!(intent.next().await.unwrap(), EventKind::ReconciledAll);
 
-    let path = Path::new(&[b"bar"]).unwrap();
-    let interests = Interests::builder().add_area(namespace, [Area::path(path.clone())]);
+    let path = Path::from_bytes(&[b"bar"]).unwrap();
+    let interests = Interests::builder().add_area(namespace, [Area::new_path(path.clone())]);
     intent.add_interests(interests).await?;
 
     assert_eq!(
         intent.next().await.unwrap(),
         EventKind::InterestIntersection {
             namespace,
-            area: Area::path(path.clone()).into()
+            area: Area::new_path(path.clone()).into_area_of_interest()
         }
     );
     assert_eq!(
         intent.next().await.unwrap(),
         EventKind::Reconciled {
             namespace,
-            area: Area::path(path.clone()).into()
+            area: Area::new_path(path.clone()).into_area_of_interest()
         }
     );
 
@@ -239,7 +244,9 @@ async fn peer_manager_twoway_loop() -> Result<()> {
     insert(&betty, namespace, betty_user, &[b"bar"], "bar 1").await?;
     let alfie_node_id = alfie.node_id();
     let betty_node_id = betty.node_id();
-    for _i in 0..20 {
+    let rounds = 20;
+    for i in 0..rounds {
+        println!("\n\nROUND {i} of {rounds}\n\n");
         let alfie = alfie.clone();
         let betty = betty.clone();
         let task_alfie = tokio::task::spawn(async move {
@@ -279,15 +286,15 @@ mod util {
     use tokio::task::JoinHandle;
 
     use iroh_willow::{
-        auth::{CapSelector, DelegateTo, RestrictArea},
         engine::{AcceptOpts, Engine},
         form::EntryForm,
-        net::ALPN,
+        interest::{CapSelector, DelegateTo, RestrictArea},
         proto::{
+            data_model::{Path, PathExt},
             keys::{NamespaceId, NamespaceKind, UserId},
             meadowcap::AccessMode,
-            willow::Path,
         },
+        ALPN,
     };
 
     pub fn create_rng(seed: &str) -> ChaCha12Rng {
@@ -309,6 +316,7 @@ mod util {
         ) -> Result<Self> {
             let endpoint = Endpoint::builder()
                 .secret_key(secret_key)
+                .relay_mode(iroh_net::relay::RelayMode::Disabled)
                 .alpns(vec![ALPN.to_vec()])
                 .bind(0)
                 .await?;
@@ -403,7 +411,7 @@ mod util {
         let cap_for_betty = alfie
             .delegate_caps(
                 CapSelector::widest(namespace_id),
-                AccessMode::ReadWrite,
+                AccessMode::Write,
                 DelegateTo::new(user_betty, RestrictArea::None),
             )
             .await?;
@@ -419,7 +427,7 @@ mod util {
         path: &[&[u8]],
         bytes: impl Into<Bytes>,
     ) -> Result<()> {
-        let path = Path::new(path)?;
+        let path = Path::from_bytes(path)?;
         let entry = EntryForm::new_bytes(namespace_id, path, bytes);
         handle.insert(entry, user).await?;
         Ok(())

@@ -1,3 +1,11 @@
+//! Intents are handles onto a Willow synchronisation session.
+//!
+//! They are created with [`crate::Engine::sync_with_peer`].
+//!
+//! An intent receives events from the session, and can submit new interests to be synchronized.
+//!
+//! Once all intents for a peer are complete, the session is closed.
+
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     future::Future,
@@ -17,13 +25,13 @@ use tokio_util::sync::PollSender;
 use tracing::{debug, trace, warn};
 
 use crate::{
-    auth::{Auth, InterestMap},
+    interest::{InterestMap, Interests},
     proto::{
         grouping::{Area, AreaOfInterest},
         keys::NamespaceId,
     },
-    session::{error::ChannelReceiverDropped, Error, Interests, SessionInit, SessionMode},
-    store::traits::Storage,
+    session::{error::ChannelReceiverDropped, Error, SessionInit, SessionMode},
+    store::{auth::Auth, traits::Storage},
     util::gen_stream::GenStream,
 };
 
@@ -37,27 +45,30 @@ pub type IntentId = u64;
 type Sender<T> = mpsc::Sender<T>;
 type Receiver<T> = mpsc::Receiver<T>;
 
+/// Events emitted from a session for an synchronisation intent.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum EventKind {
-    CapabilityIntersection {
-        namespace: NamespaceId,
-        area: Area,
-    },
+    /// We found an intersection between our and the peer's capabilities.
+    CapabilityIntersection { namespace: NamespaceId, area: Area },
+    /// We found an intersection between our and the peer's interests and will start to synchronize
+    /// the area.
     InterestIntersection {
         namespace: NamespaceId,
         area: AreaOfInterest,
     },
+    /// We reconciled an area.
     Reconciled {
         namespace: NamespaceId,
         area: AreaOfInterest,
     },
+    /// We reconciled all interests submitted in this intent.
     ReconciledAll,
-    Abort {
-        error: Arc<Error>,
-    },
+    /// The session was closed with an error.
+    Abort { error: Arc<Error> },
 }
 
 impl EventKind {
+    /// Returns the namespace if the event is related to a namespace.
     pub fn namespace(&self) -> Option<NamespaceId> {
         match self {
             EventKind::CapabilityIntersection { namespace, .. } => Some(*namespace),
@@ -68,9 +79,15 @@ impl EventKind {
     }
 }
 
+/// Updates that may be submitted from an intent into the synchronisation session.
 #[derive(Debug)]
 pub enum IntentUpdate {
+    /// Submit new interests into the session.
     AddInterests(Interests),
+    /// Close the intent.
+    ///
+    /// It is not required to send this, but may reduce the time an intent is lingering while no
+    /// subscriber is live anymore.
     Close,
 }
 
@@ -144,6 +161,7 @@ impl Intent {
     }
 }
 
+/// Outcome of driving an intent to completion.
 #[derive(Debug, Eq, PartialEq)]
 pub enum Completion {
     /// All interests were reconciled.
@@ -302,8 +320,7 @@ impl<S: Storage> IntentDispatcher<S> {
             let event_tx = info.event_tx;
             let update_rx = self.intent_update_rx.remove(&id);
             let update_rx = update_rx
-                .map(|stream| stream.into_inner())
-                .flatten()
+                .and_then(|stream| stream.into_inner())
                 .map(|stream| stream.into_inner());
             let channels = match (event_tx, update_rx) {
                 (Some(event_tx), Some(update_rx)) => Some(IntentChannels {
@@ -526,7 +543,11 @@ impl IntentInfo {
     fn matches_area(&self, namespace: &NamespaceId, area: &Area) -> bool {
         self.interests
             .get(namespace)
-            .map(|interests| interests.iter().any(|x| x.area.has_intersection(area)))
+            .map(|interests| {
+                interests
+                    .iter()
+                    .any(|x| x.area.intersection(area).is_some())
+            })
             .unwrap_or(false)
     }
 
@@ -534,7 +555,10 @@ impl IntentInfo {
         let mut namespace_complete = false;
         let mut matches = false;
         if let Some(interests) = self.interests.get_mut(namespace) {
-            if interests.iter().any(|x| x.area.has_intersection(area)) {
+            if interests
+                .iter()
+                .any(|x| x.area.intersection(area).is_some())
+            {
                 matches = true;
                 interests.retain(|x| !area.includes_area(&x.area));
                 if interests.is_empty() {

@@ -1,18 +1,23 @@
+//! Traits for storage backends for the Willow store.
+
 use std::fmt::Debug;
 
 use anyhow::Result;
 
 use crate::{
-    auth::{CapSelector, CapabilityPack},
+    interest::{CapSelector, CapabilityPack},
     proto::{
-        grouping::ThreeDRange,
+        data_model::{AuthorisedEntry, Entry, NamespaceId, WriteCapability},
+        grouping::Range3d,
         keys::{NamespaceSecretKey, NamespaceSignature, UserId, UserSecretKey, UserSignature},
-        meadowcap,
-        sync::{Fingerprint, ReadAuthorisation},
-        willow::{AuthorisedEntry, Entry, NamespaceId, WriteCapability},
+        meadowcap::{self, ReadAuthorisation},
+        wgps::Fingerprint,
     },
 };
 
+/// Storage backend.
+///
+/// This type combines the different stores needed.
 pub trait Storage: Debug + Clone + 'static {
     type Entries: EntryStorage;
     type Secrets: SecretStorage;
@@ -24,6 +29,7 @@ pub trait Storage: Debug + Clone + 'static {
     fn caps(&self) -> &Self::Caps;
 }
 
+/// Storage for user and namespace secrets.
 pub trait SecretStorage: Debug + Clone + 'static {
     fn insert(&self, secret: meadowcap::SecretKey) -> Result<(), SecretStoreError>;
     fn get_user(&self, id: &UserId) -> Option<UserSecretKey>;
@@ -71,6 +77,7 @@ pub trait SecretStorage: Debug + Clone + 'static {
     }
 }
 
+/// Storage for entries.
 pub trait EntryStorage: EntryReader + Clone + Debug + 'static {
     type Reader: EntryReader;
     type Snapshot: EntryReader + Clone;
@@ -80,34 +87,36 @@ pub trait EntryStorage: EntryReader + Clone + Debug + 'static {
     fn ingest_entry(&self, entry: &AuthorisedEntry) -> Result<bool>;
 }
 
+/// Read-only interface to [`EntryStorage`].
 pub trait EntryReader: Debug + 'static {
-    fn fingerprint(&self, namespace: NamespaceId, range: &ThreeDRange) -> Result<Fingerprint>;
+    fn fingerprint(&self, namespace: NamespaceId, range: &Range3d) -> Result<Fingerprint>;
 
     fn split_range(
         &self,
         namespace: NamespaceId,
-        range: &ThreeDRange,
+        range: &Range3d,
         config: &SplitOpts,
     ) -> Result<impl Iterator<Item = Result<RangeSplit>>>;
 
-    fn count(&self, namespace: NamespaceId, range: &ThreeDRange) -> Result<u64>;
+    fn count(&self, namespace: NamespaceId, range: &Range3d) -> Result<u64>;
 
     fn get_entries_with_authorisation<'a>(
         &'a self,
         namespace: NamespaceId,
-        range: &ThreeDRange,
+        range: &Range3d,
     ) -> impl Iterator<Item = Result<AuthorisedEntry>> + 'a;
 
     fn get_entries(
         &self,
         namespace: NamespaceId,
-        range: &ThreeDRange,
+        range: &Range3d,
     ) -> impl Iterator<Item = Result<Entry>> {
         self.get_entries_with_authorisation(namespace, range)
-            .map(|e| e.map(|e| e.into_entry()))
+            .map(|e| e.map(|e| e.into_parts().0))
     }
 }
 
+/// Error returned from [`SecretStorage`].
 #[derive(Debug, thiserror::Error)]
 pub enum SecretStoreError {
     #[error("store failed: {0}")]
@@ -122,7 +131,7 @@ pub enum KeyScope {
     User,
 }
 
-pub type RangeSplit = (ThreeDRange, SplitAction);
+pub type RangeSplit = (Range3d, SplitAction);
 
 #[derive(Debug)]
 pub enum SplitAction {
@@ -147,6 +156,7 @@ impl Default for SplitOpts {
     }
 }
 
+/// Capability storage.
 pub trait CapsStorage: Debug + Clone {
     fn insert(&self, cap: CapabilityPack) -> Result<()>;
 

@@ -10,7 +10,7 @@ use tracing::{debug, error_span, trace, warn, Instrument, Span};
 
 use crate::{
     net::ConnHandle,
-    proto::sync::{ControlIssueGuarantee, LogicalChannel, Message, SetupBindAreaOfInterest},
+    proto::wgps::{ControlIssueGuarantee, LogicalChannel, Message, SetupBindAreaOfInterest},
     session::{
         aoi_finder::{self, IntersectionFinder},
         capabilities::Capabilities,
@@ -74,7 +74,7 @@ pub(crate) async fn run_session<S: Storage>(
         .fold(SessionMode::ReconcileOnce, |cur, intent| {
             match intent.init.mode {
                 SessionMode::ReconcileOnce => cur,
-                SessionMode::Live => SessionMode::Live,
+                SessionMode::Continuous => SessionMode::Continuous,
             }
         });
 
@@ -107,7 +107,7 @@ pub(crate) async fn run_session<S: Storage>(
 
     // Setup data channels only if in live mode.
     // TODO: Adapt to changing mode.
-    let (data_inbox, data_inbox_rx) = if mode == SessionMode::Live {
+    let (data_inbox, data_inbox_rx) = if mode == SessionMode::Continuous {
         let (data_inbox, data_inbox_rx) =
             cancelable_channel::<data::Input>(2, cancel_token.clone());
         (Some(data_inbox), Some(data_inbox_rx))
@@ -231,7 +231,7 @@ pub(crate) async fn run_session<S: Storage>(
                         .await?;
                 }
                 Output::SignAndSendSubspaceCap(handle, cap) => {
-                    let message = caps.sign_subspace_capabiltiy(store.secrets(), cap, handle)?;
+                    let message = caps.sign_subspace_capability(store.secrets(), cap, handle)?;
                     channel_sender.send(Box::new(message)).await?;
                 }
             }
@@ -249,6 +249,7 @@ pub(crate) async fn run_session<S: Storage>(
             session_id,
             channel_sender.clone(),
             our_role,
+            initial_transmission.their_max_payload_size,
         );
         while let Some(output) = gen.try_next().await? {
             match output {
@@ -283,7 +284,7 @@ pub(crate) async fn run_session<S: Storage>(
     let caps_recv_loop = with_span(error_span!("caps_recv"), async {
         while let Some(message) = capability_recv.try_next().await? {
             let handle = message.handle;
-            caps.validate_and_bind_theirs(message.capability, message.signature)?;
+            caps.validate_and_bind_theirs(message.capability.0, message.signature)?;
             pai_inbox
                 .send(pai::Input::ReceivedReadCapForIntersection(handle))
                 .await?;
@@ -318,9 +319,12 @@ pub(crate) async fn run_session<S: Storage>(
                 area_of_interest,
                 authorisation,
             } = message;
+            let area_of_interest = area_of_interest.0;
             let cap = caps.get_theirs_eventually(authorisation).await;
-            cap.try_granted_area(&area_of_interest.area)?;
-            let namespace = cap.granted_namespace().id();
+            if !cap.granted_area().includes_area(&area_of_interest.area) {
+                return Err(Error::UnauthorisedArea);
+            }
+            let namespace = *cap.granted_namespace();
             intersection_inbox
                 .send(aoi_finder::Input::ReceivedValidatedAoi {
                     namespace,
@@ -432,7 +436,7 @@ async fn control_loop(
                 pai_inbox
                     .send(pai::Input::ReceivedVerifiedSubspaceCapReply(
                         msg.handle,
-                        msg.capability.granted_namespace().id(),
+                        *msg.capability.granted_namespace(),
                     ))
                     .await?;
             }
@@ -476,7 +480,10 @@ async fn with_span<T: std::fmt::Debug>(
     async {
         trace!("start");
         let res = fut.await;
-        trace!(?res, "done");
+        match &res {
+            Ok(_) => trace!("done"),
+            Err(err) => debug!(?err, "session task failed"),
+        }
         res
     }
     .instrument(span)

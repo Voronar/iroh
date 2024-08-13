@@ -4,18 +4,20 @@ use futures_lite::{Stream, StreamExt};
 use genawaiter::rc::Co;
 
 use crate::{
-    auth::InterestMap,
+    interest::InterestMap,
     proto::{
         grouping::{Area, AreaOfInterest},
         keys::NamespaceId,
-        sync::{
-            AreaOfInterestHandle, CapabilityHandle, IntersectionHandle, ReadAuthorisation,
-            ReadCapability, SetupBindAreaOfInterest,
+        meadowcap::{ReadAuthorisation, ReadCapability},
+        wgps::{
+            AreaOfInterestHandle, CapabilityHandle, IntersectionHandle, SetupBindAreaOfInterest,
         },
     },
     session::{
-        capabilities::Capabilities, pai_finder::PaiIntersection, resource::ResourceMap, Error,
-        Scope,
+        capabilities::Capabilities,
+        pai_finder::PaiIntersection,
+        resource::{ResourceMap, Scope},
+        Error,
     },
     util::gen_stream::GenStream,
 };
@@ -185,7 +187,7 @@ impl AoiResources {
         self.bind_validated(co, Scope::Ours, namespace, aoi.clone())
             .await;
         let msg = SetupBindAreaOfInterest {
-            area_of_interest: aoi,
+            area_of_interest: aoi.into(),
             authorisation,
         };
         co.yield_(Output::SendMessage(msg)).await;

@@ -8,10 +8,12 @@
 use std::{cmp::Ordering, fmt, str::FromStr};
 
 use derive_more::{AsRef, Deref, From, Into};
-use ed25519_dalek::{SignatureError, Signer, SigningKey, VerifyingKey};
+use ed25519_dalek::{SignatureError, Signer, SigningKey, Verifier, VerifyingKey};
 use iroh_base::base32;
 use rand_core::CryptoRngCore;
 use serde::{Deserialize, Serialize};
+
+use super::meadowcap::IsCommunal;
 
 pub const PUBLIC_KEY_LENGTH: usize = ed25519_dalek::PUBLIC_KEY_LENGTH;
 pub const SECRET_KEY_LENGTH: usize = ed25519_dalek::SECRET_KEY_LENGTH;
@@ -45,12 +47,16 @@ macro_rules! bytestring {
     };
 }
 
-/// Returns `true` if the last bit of a byte slice is 1, which defines a communal namespace in this
-/// willow implementation.
-fn is_communal(pubkey_bytes: &[u8; 32]) -> bool {
-    let last = pubkey_bytes.last().expect("pubkey is not empty");
-    // Check if last bit is 1.
-    (*last & 0x1) == 0x1
+impl IsCommunal for NamespaceId {
+    fn is_communal(&self) -> bool {
+        self.as_bytes()[31] == 0
+    }
+}
+
+impl IsCommunal for NamespacePublicKey {
+    fn is_communal(&self) -> bool {
+        self.id().is_communal()
+    }
 }
 
 /// The type of the namespace, either communal or owned.
@@ -61,7 +67,7 @@ fn is_communal(pubkey_bytes: &[u8; 32]) -> bool {
 pub enum NamespaceKind {
     /// Communal namespace, needs [`super::meadowcap::CommunalCapability`] to authorizse.
     Communal,
-    /// Owned namespace, neads [`super::meadowcap::OwnedCapability`] to authorize.
+    /// Owned namespace, needs [`super::meadowcap::OwnedCapability`] to authorize.
     Owned,
 }
 
@@ -121,11 +127,6 @@ pub struct NamespacePublicKey(VerifyingKey);
 bytestring!(NamespacePublicKey, PUBLIC_KEY_LENGTH);
 
 impl NamespacePublicKey {
-    /// Whether this is the key for a communal namespace.
-    pub fn is_communal(&self) -> bool {
-        is_communal(self.as_bytes())
-    }
-
     pub fn kind(&self) -> NamespaceKind {
         if self.is_communal() {
             NamespaceKind::Communal
@@ -343,6 +344,13 @@ impl From<&UserSecretKey> for UserPublicKey {
 #[derive(Serialize, Deserialize, Clone, From, PartialEq, Eq, Deref)]
 pub struct NamespaceSignature(ed25519_dalek::Signature);
 
+impl NamespaceSignature {
+    /// Create from a byte array.
+    pub fn from_bytes(bytes: [u8; SIGNATURE_LENGTH]) -> Self {
+        Self(ed25519_dalek::Signature::from_bytes(&bytes))
+    }
+}
+
 impl PartialOrd for NamespaceSignature {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
@@ -366,6 +374,13 @@ impl std::hash::Hash for NamespaceSignature {
 /// The signature obtained by signing a message with a [`UserSecretKey`].
 #[derive(Serialize, Deserialize, Clone, From, PartialEq, Eq, Deref)]
 pub struct UserSignature(ed25519_dalek::Signature);
+
+impl UserSignature {
+    /// Create from a byte array.
+    pub fn from_bytes(bytes: [u8; SIGNATURE_LENGTH]) -> Self {
+        Self(ed25519_dalek::Signature::from_bytes(&bytes))
+    }
+}
 
 impl PartialOrd for UserSignature {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
@@ -551,5 +566,227 @@ impl FromStr for NamespaceId {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         NamespacePublicKey::from_str(s).map(|x| x.into())
+    }
+}
+
+mod willow_impls {
+    use crate::util::increment_by_one;
+
+    use super::*;
+
+    impl willow_data_model::SubspaceId for UserId {
+        fn successor(&self) -> Option<Self> {
+            increment_by_one(self.as_bytes()).map(Self::from_bytes_unchecked)
+        }
+    }
+
+    impl willow_data_model::SubspaceId for UserPublicKey {
+        fn successor(&self) -> Option<Self> {
+            match increment_by_one(self.as_bytes()) {
+                Some(bytes) => Self::from_bytes(&bytes).ok(),
+                None => None,
+            }
+        }
+    }
+
+    impl willow_data_model::NamespaceId for NamespaceId {}
+    impl willow_data_model::NamespaceId for NamespacePublicKey {}
+
+    impl Verifier<UserSignature> for UserPublicKey {
+        fn verify(
+            &self,
+            msg: &[u8],
+            signature: &UserSignature,
+        ) -> Result<(), ed25519_dalek::ed25519::Error> {
+            self.0.verify(msg, &signature.0)
+        }
+    }
+
+    impl Verifier<UserSignature> for UserId {
+        fn verify(
+            &self,
+            msg: &[u8],
+            signature: &UserSignature,
+        ) -> Result<(), ed25519_dalek::ed25519::Error> {
+            // TODO: Cache this in a global LRU cache.
+            let key = self.into_public_key()?;
+            key.0.verify(msg, &signature.0)
+        }
+    }
+
+    impl Verifier<NamespaceSignature> for NamespacePublicKey {
+        fn verify(
+            &self,
+            msg: &[u8],
+            signature: &NamespaceSignature,
+        ) -> Result<(), ed25519_dalek::ed25519::Error> {
+            self.0.verify(msg, &signature.0)
+        }
+    }
+
+    impl Verifier<NamespaceSignature> for NamespaceId {
+        fn verify(
+            &self,
+            msg: &[u8],
+            signature: &NamespaceSignature,
+        ) -> Result<(), ed25519_dalek::ed25519::Error> {
+            // TODO: Cache this in a global LRU cache.
+            let key = self.into_public_key()?;
+            key.0.verify(msg, &signature.0)
+        }
+    }
+
+    impl Signer<UserSignature> for UserSecretKey {
+        fn try_sign(&self, msg: &[u8]) -> Result<UserSignature, ed25519_dalek::ed25519::Error> {
+            Ok(UserSignature(self.0.sign(msg)))
+        }
+    }
+
+    impl Signer<NamespaceSignature> for NamespaceSecretKey {
+        fn try_sign(
+            &self,
+            msg: &[u8],
+        ) -> Result<NamespaceSignature, ed25519_dalek::ed25519::Error> {
+            Ok(NamespaceSignature(self.0.sign(msg)))
+        }
+    }
+}
+
+use syncify::syncify;
+use syncify::syncify_replace;
+
+#[syncify(encoding_sync)]
+mod encoding {
+    #[syncify_replace(use ufotofu::sync::{BulkConsumer, BulkProducer};)]
+    use ufotofu::local_nb::{BulkConsumer, BulkProducer};
+
+    use willow_encoding::DecodeError;
+    #[syncify_replace(use willow_encoding::sync::{Encodable, Decodable};)]
+    use willow_encoding::{Decodable, Encodable};
+
+    use super::*;
+
+    impl Encodable for NamespacePublicKey {
+        async fn encode<Consumer>(&self, consumer: &mut Consumer) -> Result<(), Consumer::Error>
+        where
+            Consumer: BulkConsumer<Item = u8>,
+        {
+            consumer
+                .bulk_consume_full_slice(self.as_bytes())
+                .await
+                .map_err(|err| err.reason)
+        }
+    }
+
+    impl Encodable for UserPublicKey {
+        async fn encode<Consumer>(&self, consumer: &mut Consumer) -> Result<(), Consumer::Error>
+        where
+            Consumer: BulkConsumer<Item = u8>,
+        {
+            consumer
+                .bulk_consume_full_slice(self.as_bytes())
+                .await
+                .map_err(|err| err.reason)
+        }
+    }
+
+    impl Encodable for NamespaceSignature {
+        async fn encode<Consumer>(&self, consumer: &mut Consumer) -> Result<(), Consumer::Error>
+        where
+            Consumer: BulkConsumer<Item = u8>,
+        {
+            consumer
+                .bulk_consume_full_slice(&self.to_bytes())
+                .await
+                .map_err(|err| err.reason)
+        }
+    }
+
+    impl Encodable for UserSignature {
+        async fn encode<Consumer>(&self, consumer: &mut Consumer) -> Result<(), Consumer::Error>
+        where
+            Consumer: BulkConsumer<Item = u8>,
+        {
+            consumer
+                .bulk_consume_full_slice(&self.to_bytes())
+                .await
+                .map_err(|err| err.reason)
+        }
+    }
+
+    impl Encodable for UserId {
+        async fn encode<Consumer>(&self, consumer: &mut Consumer) -> Result<(), Consumer::Error>
+        where
+            Consumer: BulkConsumer<Item = u8>,
+        {
+            consumer
+                .bulk_consume_full_slice(self.as_bytes())
+                .await
+                .map_err(|err| err.reason)
+        }
+    }
+
+    impl Encodable for NamespaceId {
+        async fn encode<Consumer>(&self, consumer: &mut Consumer) -> Result<(), Consumer::Error>
+        where
+            Consumer: BulkConsumer<Item = u8>,
+        {
+            consumer
+                .bulk_consume_full_slice(self.as_bytes())
+                .await
+                .map_err(|err| err.reason)
+        }
+    }
+
+    impl Decodable for NamespaceId {
+        async fn decode<Producer>(
+            producer: &mut Producer,
+        ) -> Result<Self, DecodeError<Producer::Error>>
+        where
+            Producer: BulkProducer<Item = u8>,
+        {
+            let mut bytes = [0; PUBLIC_KEY_LENGTH];
+            producer.bulk_overwrite_full_slice(&mut bytes).await?;
+            Ok(Self::from_bytes_unchecked(bytes))
+        }
+    }
+
+    impl Decodable for UserId {
+        async fn decode<Producer>(
+            producer: &mut Producer,
+        ) -> Result<Self, DecodeError<Producer::Error>>
+        where
+            Producer: BulkProducer<Item = u8>,
+        {
+            let mut bytes = [0; PUBLIC_KEY_LENGTH];
+            producer.bulk_overwrite_full_slice(&mut bytes).await?;
+            Ok(Self::from_bytes_unchecked(bytes))
+        }
+    }
+
+    impl Decodable for NamespaceSignature {
+        async fn decode<Producer>(
+            producer: &mut Producer,
+        ) -> Result<Self, DecodeError<Producer::Error>>
+        where
+            Producer: BulkProducer<Item = u8>,
+        {
+            let mut bytes = [0; SIGNATURE_LENGTH];
+            producer.bulk_overwrite_full_slice(&mut bytes).await?;
+            Ok(Self::from_bytes(bytes))
+        }
+    }
+
+    impl Decodable for UserSignature {
+        async fn decode<Producer>(
+            producer: &mut Producer,
+        ) -> Result<Self, DecodeError<Producer::Error>>
+        where
+            Producer: BulkProducer<Item = u8>,
+        {
+            let mut bytes = [0; SIGNATURE_LENGTH];
+            producer.bulk_overwrite_full_slice(&mut bytes).await?;
+            Ok(Self::from_bytes(bytes))
+        }
     }
 }

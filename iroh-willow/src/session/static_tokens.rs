@@ -7,8 +7,8 @@ use std::{
 
 use crate::{
     proto::{
-        sync::{DynamicToken, SetupBindStaticToken, StaticToken, StaticTokenHandle},
-        willow::{AuthorisedEntry, Entry},
+        data_model::{AuthorisationToken, AuthorisedEntry, Entry},
+        wgps::{DynamicToken, SetupBindStaticToken, StaticToken, StaticTokenHandle},
     },
     session::{channels::ChannelSenders, resource::ResourceMap, Error},
 };
@@ -54,9 +54,8 @@ impl StaticTokens {
         })
         .await;
 
-        let authorised_entry =
-            AuthorisedEntry::try_from_parts(entry, static_token.clone(), dynamic_token)?;
-
+        let token = AuthorisationToken::new(static_token.0, dynamic_token);
+        let authorised_entry = AuthorisedEntry::new(entry, token)?;
         Ok(authorised_entry)
     }
 }

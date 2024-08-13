@@ -1,5 +1,4 @@
 use std::{
-    future::poll_fn,
     marker::PhantomData,
     pin::Pin,
     task::{self, ready, Poll},
@@ -9,7 +8,7 @@ use futures_lite::Stream;
 use tracing::trace;
 
 use crate::{
-    proto::sync::{
+    proto::wgps::{
         Channel, DataMessage, IntersectionMessage, LogicalChannel, Message, ReconciliationMessage,
         SetupBindAreaOfInterest, SetupBindReadCapability, SetupBindStaticToken,
     },
@@ -25,13 +24,13 @@ pub struct MessageReceiver<T> {
 }
 
 impl<T: TryFrom<Message>> MessageReceiver<T> {
-    pub async fn recv(&mut self) -> Option<Result<T, Error>> {
-        poll_fn(|cx| self.poll_recv(cx)).await
-    }
+    // pub async fn recv(&mut self) -> Option<Result<T, Error>> {
+    //     poll_fn(|cx| self.poll_recv(cx)).await
+    // }
 
-    pub fn close(&self) {
-        self.inner.close()
-    }
+    // pub fn close(&self) {
+    //     self.inner.close()
+    // }
 
     pub fn poll_recv(&mut self, cx: &mut task::Context<'_>) -> Poll<Option<Result<T, Error>>> {
         let message = ready!(Pin::new(&mut self.inner).poll_next(cx));
@@ -75,14 +74,14 @@ pub struct LogicalChannelReceivers {
 }
 
 impl LogicalChannelReceivers {
-    pub fn close(&self) {
-        self.intersection_recv.close();
-        self.reconciliation_recv.close();
-        self.static_tokens_recv.close();
-        self.capability_recv.close();
-        self.aoi_recv.close();
-        self.data_recv.close();
-    }
+    // pub fn close(&self) {
+    //     self.intersection_recv.close();
+    //     self.reconciliation_recv.close();
+    //     self.static_tokens_recv.close();
+    //     self.capability_recv.close();
+    //     self.aoi_recv.close();
+    //     self.data_recv.close();
+    // }
 }
 
 #[derive(Debug, Clone)]

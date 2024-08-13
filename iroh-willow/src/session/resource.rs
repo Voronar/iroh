@@ -3,9 +3,20 @@ use std::{
     task::{Context, Poll, Waker},
 };
 
-use crate::proto::sync::{IsHandle, ResourceHandle};
+use crate::proto::wgps::{IsHandle, ResourceHandle};
 
 use super::Error;
+
+/// The bind scope for resources.
+///
+/// Resources are bound by either peer
+#[derive(Copy, Clone, Debug)]
+pub enum Scope {
+    /// Resources bound by ourselves.
+    Ours,
+    /// Resources bound by the other peer.
+    Theirs,
+}
 
 #[derive(Debug)]
 pub struct ResourceMap<H, R> {

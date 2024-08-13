@@ -1,12 +1,21 @@
-use crate::{
-    proto::sync::AccessChallengeBytes,
-    session::{Error, Role},
+use super::{Error, Role};
+use crate::proto::{
+    keys::{UserPublicKey, UserSignature},
+    wgps::{AccessChallenge, AccessChallengeBytes, ChallengeHash},
 };
 
-use super::{
-    keys::{UserPublicKey, UserSecretKey, UserSignature},
-    sync::{AccessChallenge, ChallengeHash},
-};
+/// Data from the initial transmission
+///
+/// This happens before the session is initialized.
+#[derive(Debug)]
+pub struct InitialTransmission {
+    /// The [`AccessChallenge`] nonce, whose hash we sent to the remote.
+    pub our_nonce: AccessChallenge,
+    /// The [`ChallengeHash`] we received from the remote.
+    pub received_commitment: ChallengeHash,
+    /// The maximum payload size we received from the remote.
+    pub their_max_payload_size: u64,
+}
 
 #[derive(Debug)]
 pub enum ChallengeState {
@@ -48,11 +57,11 @@ impl ChallengeState {
         matches!(self, Self::Revealed { .. })
     }
 
-    pub fn sign(&self, secret_key: &UserSecretKey) -> Result<UserSignature, Error> {
-        let signable = self.signable()?;
-        let signature = secret_key.sign(&signable);
-        Ok(signature)
-    }
+    // pub fn sign(&self, secret_key: &UserSecretKey) -> Result<UserSignature, Error> {
+    //     let signable = self.signable()?;
+    //     let signature = secret_key.sign(&signable);
+    //     Ok(signature)
+    // }
 
     pub fn signable(&self) -> Result<[u8; 32], Error> {
         let challenge = self.get_ours()?;

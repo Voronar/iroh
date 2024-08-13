@@ -1,22 +1,20 @@
 use ed25519_dalek::SignatureError;
 
 use crate::{
-    proto::{
-        meadowcap::{self, UserId},
-        sync::ResourceHandle,
-        willow::Unauthorised,
-    },
+    proto::{data_model::UnauthorisedWriteError, meadowcap::UserId, wgps::ResourceHandle},
     session::{pai_finder::PaiError, resource::MissingResource},
     store::traits::SecretStoreError,
     util::channel::{ReadError, WriteError},
 };
 
+// This is a catch-all error type for the session module.
+// TODO: Split this into multiple error types
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("local store failed: {0}")]
     Store(#[from] anyhow::Error),
     #[error("authentication error: {0}")]
-    Auth(#[from] crate::auth::AuthError),
+    Auth(#[from] crate::store::auth::AuthError),
     #[error("payload store failed: {0}")]
     PayloadStore(std::io::Error),
     #[error("payload digest does not match expected digest")]
@@ -45,13 +43,15 @@ pub enum Error {
     AreaOfInterestNamespaceMismatch,
     #[error("our and their area of interests do not overlap")]
     AreaOfInterestDoesNotOverlap,
+    #[error("received an area of interest which is not authorised")]
+    UnauthorisedArea,
     #[error("received an entry which is not authorised")]
-    UnauthorisedEntryReceived,
+    UnauthorisedWrite(#[from] UnauthorisedWriteError),
     #[error("received an unsupported message type")]
     UnsupportedMessage,
     #[error("received a message that is intended for another channel")]
     WrongChannel,
-    #[error("the received nonce does not match the received committment")]
+    #[error("the received nonce does not match the received commitment")]
     BrokenCommittement,
     #[error("received an actor message for unknown session")]
     SessionNotFound,
@@ -112,16 +112,11 @@ impl PartialEq for Error {
 
 impl Eq for Error {}
 
-impl From<Unauthorised> for Error {
-    fn from(_value: Unauthorised) -> Self {
-        Self::UnauthorisedEntryReceived
-    }
-}
-impl From<meadowcap::InvalidCapability> for Error {
-    fn from(_value: meadowcap::InvalidCapability) -> Self {
-        Self::InvalidCapability
-    }
-}
+// impl From<meadowcap::InvalidCapability> for Error {
+//     fn from(_value: meadowcap::InvalidCapability) -> Self {
+//         Self::InvalidCapability
+//     }
+// }
 
 impl From<SignatureError> for Error {
     fn from(_value: SignatureError) -> Self {
@@ -129,11 +124,11 @@ impl From<SignatureError> for Error {
     }
 }
 
-impl From<meadowcap::InvalidParams> for Error {
-    fn from(_value: meadowcap::InvalidParams) -> Self {
-        Self::InvalidParameters("")
-    }
-}
+// impl From<meadowcap::InvalidParams> for Error {
+//     fn from(_value: meadowcap::InvalidParams) -> Self {
+//         Self::InvalidParameters("")
+//     }
+// }
 
 impl From<MissingResource> for Error {
     fn from(value: MissingResource) -> Self {

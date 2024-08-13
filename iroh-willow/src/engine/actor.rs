@@ -12,17 +12,16 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, error_span, trace, warn, Instrument};
 
 use crate::{
-    auth::{CapSelector, CapabilityPack, DelegateTo, InterestMap},
     form::{AuthForm, EntryForm, EntryOrForm},
+    interest::{CapSelector, CapabilityPack, DelegateTo, InterestMap, Interests},
     net::ConnHandle,
     proto::{
-        grouping::ThreeDRange,
+        data_model::{AuthorisedEntry, Entry},
+        grouping::Range3d,
         keys::{NamespaceId, NamespaceKind, UserId, UserSecretKey},
-        meadowcap::{self, AccessMode},
-        sync::ReadAuthorisation,
-        willow::{AuthorisedEntry, Entry},
+        meadowcap::{self, AccessMode, ReadAuthorisation},
     },
-    session::{intents::Intent, run_session, Error, EventSender, Interests, SessionHandle},
+    session::{intents::Intent, run_session, Error, EventSender, SessionHandle},
     store::{
         entry::EntryOrigin,
         traits::{EntryReader, SecretStorage, Storage},
@@ -34,6 +33,7 @@ pub const INBOX_CAP: usize = 1024;
 pub const SESSION_EVENT_CHANNEL_CAP: usize = 64;
 pub const SESSION_UPDATE_CHANNEL_CAP: usize = 64;
 
+/// Handle to a Willow storage thread.
 #[derive(Debug, Clone)]
 pub struct ActorHandle {
     inbox_tx: flume::Sender<Input>,
@@ -125,7 +125,7 @@ impl ActorHandle {
     pub async fn get_entries(
         &self,
         namespace: NamespaceId,
-        range: ThreeDRange,
+        range: Range3d,
     ) -> Result<impl Stream<Item = anyhow::Result<Entry>>> {
         let (tx, rx) = flume::bounded(1024);
         self.send(Input::GetEntries {
@@ -256,7 +256,7 @@ pub enum Input {
     },
     GetEntries {
         namespace: NamespaceId,
-        range: ThreeDRange,
+        range: Range3d,
         #[debug(skip)]
         reply: flume::Sender<Result<Entry>>,
     },
@@ -403,7 +403,7 @@ impl<S: Storage> Actor<S> {
 
                 self.tasks.spawn_local(async move {
                     if let Err(err) = future.await {
-                        tracing::debug!(?peer, ?session_id, ?err, "session failed");
+                        debug!(?peer, ?session_id, ?err, "session failed");
                     }
                 });
 

@@ -20,14 +20,15 @@ use tokio_util::{either::Either, sync::CancellationToken};
 use tracing::{debug, error_span, instrument, trace, warn, Instrument, Span};
 
 use crate::{
+    interest::Interests,
     net::{
         establish, prepare_channels, terminate_gracefully, ChannelStreams, ConnHandle, ALPN,
-        ERROR_CODE_DUPLICATE_CONN, ERROR_CODE_SHUTDOWN,
+        ERROR_CODE_DUPLICATE_CONN, ERROR_CODE_FAIL, ERROR_CODE_SHUTDOWN,
     },
-    proto::sync::{AccessChallenge, InitialTransmission},
+    proto::wgps::AccessChallenge,
     session::{
         intents::{EventKind, Intent},
-        Error, Interests, Role, SessionEvent, SessionHandle, SessionInit, SessionUpdate,
+        Error, InitialTransmission, Role, SessionEvent, SessionHandle, SessionInit, SessionUpdate,
     },
 };
 
@@ -286,7 +287,7 @@ impl PeerManager {
                     channel_streams,
                 })
             };
-            let abort_handle = spawn_conn_task(&mut self.conn_tasks, &peer_info, fut);
+            let abort_handle = spawn_conn_task(&mut self.conn_tasks, peer_info, fut);
             peer_info.abort_handle = Some(abort_handle);
         }
     }
@@ -307,6 +308,7 @@ impl PeerManager {
                 let cancel_dial2 = cancel_dial.clone();
                 // Future that dials and establishes the connection. Can be cancelled for simultaneous connection.
                 let fut = async move {
+                    debug!("connecting");
                     let conn = tokio::select! {
                         res = endpoint.connect_by_node_id(peer, ALPN) => res,
                         _ = cancel_dial.cancelled() => {
@@ -328,7 +330,7 @@ impl PeerManager {
                         channel_streams,
                     })
                 };
-                let abort_handle = spawn_conn_task(&mut self.conn_tasks, &peer_info, fut);
+                let abort_handle = spawn_conn_task(&mut self.conn_tasks, peer_info, fut);
                 peer_info.abort_handle = Some(abort_handle);
                 peer_info.state = PeerState::Pending {
                     intents: vec![intent],
@@ -361,12 +363,12 @@ impl PeerManager {
             SessionEvent::Established => {}
             SessionEvent::Complete {
                 result,
-                we_cancelled,
                 senders,
                 remaining_intents,
                 mut update_receiver,
+                ..
             } => {
-                trace!(error=?result.err(), ?we_cancelled, ?remaining_intents, "session complete");
+                trace!(error=?result.err(), ?remaining_intents, "session complete");
 
                 // Close the channel senders. This will cause our send loops to close,
                 // which in turn causes the receive loops of the other peer to close.
@@ -393,8 +395,7 @@ impl PeerManager {
                     old_intents: remaining_intents,
                     new_intents,
                 };
-                // Store whether we initiated the termination. We will need this for the graceful termination logic later.
-                peer_info.we_cancelled = we_cancelled;
+                trace!("entering closing state");
             }
         }
     }
@@ -423,7 +424,7 @@ impl PeerManager {
                         if reason.error_code == ERROR_CODE_DUPLICATE_CONN =>
                     {
                         debug!(
-                            "connection was cancelled by the remote: simultaneous connection and theirs wins"
+                            "connection was cancelled by the remote: simultaneous connection and their's wins"
                         );
                         if our_role != peer_info.our_role {
                             // TODO: setup a timeout to kill intents if the other conn doesn't make it.
@@ -431,10 +432,10 @@ impl PeerManager {
                         }
                     }
                     _ => {
-                        warn!(?err, "connection failed");
                         let peer = self.peers.remove(&peer).expect("just checked");
                         match peer.state {
                             PeerState::Pending { intents, .. } => {
+                                warn!(?err, "connection failed while pending");
                                 // If we were still in pending state, terminate all pending intents.
                                 let err = Arc::new(Error::Net(err));
                                 join_all(
@@ -448,6 +449,7 @@ impl PeerManager {
                                 old_intents,
                                 new_intents,
                             } => {
+                                debug!(?err, "connection failed to close gracefully");
                                 // If we were are in closing state, we still forward the connection error to the intents.
                                 // This would be the place where we'd implement retries: instead of aborting the intents, resubmit them.
                                 // Right now, we only resubmit intents that were submitted while terminating a session, and only if the session closed gracefully.
@@ -460,12 +462,19 @@ impl PeerManager {
                                 )
                                 .await;
                             }
-                            _ => {
-                                // TODO: Not sure if this is good practice?
+                            PeerState::Active { .. } => {
+                                // We do not care about intents here, they will be handled in the
+                                // session (which will error as well because all channels are now
+                                // closed).
+                                warn!(?err, "connection failed while active");
+                                // TODO:(Frando): Not sure if this is good practice?
                                 // A `debug_assert` is far too much, because this can be triggered by other peers.
                                 // However in tests I want to make sure that *all* connections terminate gracefully.
                                 #[cfg(test)]
                                 panic!("connection failed: {err:?}");
+                            }
+                            PeerState::None => {
+                                warn!(?err, "connection failed while peer is in None state");
                             }
                         }
                     }
@@ -480,6 +489,7 @@ impl PeerManager {
                     ref mut intents, ..
                 } = &mut peer_info.state
                 else {
+                    conn.close(ERROR_CODE_FAIL, b"invalid-state");
                     drop(conn);
                     // TODO: unreachable?
                     return Err(anyhow!(
@@ -517,7 +527,7 @@ impl PeerManager {
                 let session_handle = self.actor.init_session(conn_handle, intents).await?;
 
                 let fut = fut.map_ok(move |()| ConnStep::Done { conn });
-                let abort_handle = spawn_conn_task(&mut self.conn_tasks, &peer_info, fut);
+                let abort_handle = spawn_conn_task(&mut self.conn_tasks, peer_info, fut);
 
                 let SessionHandle {
                     cancel_token,
@@ -535,55 +545,40 @@ impl PeerManager {
             }
             Ok(ConnStep::Done { conn }) => {
                 trace!("connection loop finished");
-                let we_cancelled = peer_info.we_cancelled;
-                let me = self.endpoint.node_id();
                 let fut = async move {
-                    let error = terminate_gracefully(&conn, me, peer, we_cancelled).await?;
-                    Ok(ConnStep::Closed { conn, error })
+                    terminate_gracefully(&conn).await?;
+                    // The connection is fully closed.
+                    drop(conn);
+                    Ok(ConnStep::Closed)
                 };
-                let abort_handle = spawn_conn_task(&mut self.conn_tasks, &peer_info, fut);
+                let abort_handle = spawn_conn_task(&mut self.conn_tasks, peer_info, fut);
                 if let PeerState::Closing { .. } = &peer_info.state {
                     peer_info.abort_handle = Some(abort_handle);
                 } else {
                     // TODO: What do we do with the closing abort handle in case we have a new connection already?
                 }
             }
-            Ok(ConnStep::Closed { error, conn }) => {
-                match &error {
-                    None => debug!("connection closed gracefully"),
-                    Some(error) => warn!(?error, "failed to close connection gracefully"),
-                }
+            Ok(ConnStep::Closed) => {
+                debug!("connection closed gracefully");
+                let peer_info = self.peers.remove(&peer).expect("just checked");
                 if let PeerState::Closing {
-                    ref mut new_intents,
-                    ref mut old_intents,
+                    new_intents,
+                    old_intents,
                 } = peer_info.state
                 {
-                    if let Some(error) = error {
-                        // If the connection did not close gracefully, terminate the pending intents with the connection error.
-                        let err = Arc::new(Error::Net(error.into()));
-                        join_all(
-                            old_intents
-                                .drain(..)
-                                .map(|intent| intent.send_abort(err.clone())),
-                        )
-                        .await;
-                    } else {
-                        // Otherwise, just drop the old intents.
-                        let _ = old_intents.drain(..);
-                    };
-                    let intents = std::mem::take(new_intents);
-                    self.peers.remove(&peer);
-                    if !intents.is_empty() {
+                    drop(old_intents);
+                    if !new_intents.is_empty() {
                         debug!(
                             "resubmitting {} intents that were not yet processed",
-                            intents.len()
+                            new_intents.len()
                         );
-                        for intent in intents {
+                        for intent in new_intents {
                             self.submit_intent(peer, intent).await;
                         }
                     }
+                } else {
+                    warn!(state=%peer_info.state, "reached closed step for peer in wrong state");
                 }
-                drop(conn);
             }
         }
         Ok(())
@@ -631,7 +626,6 @@ struct PeerInfo {
     abort_handle: Option<AbortHandle>,
     state: PeerState,
     span: Span,
-    we_cancelled: bool,
 }
 
 impl PeerInfo {
@@ -642,7 +636,6 @@ impl PeerInfo {
             abort_handle: None,
             state: PeerState::None,
             span: error_span!("conn", peer=%peer.fmt_short()),
-            we_cancelled: false,
         }
     }
 }
@@ -674,10 +667,7 @@ enum ConnStep {
     Done {
         conn: Connection,
     },
-    Closed {
-        conn: Connection,
-        error: Option<ConnectionError>,
-    },
+    Closed,
 }
 
 /// The internal handlers for the [`AcceptOpts].

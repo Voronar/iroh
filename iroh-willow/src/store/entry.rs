@@ -4,13 +4,12 @@ use std::{
 };
 use tokio::sync::broadcast;
 
-use crate::{
-    proto::{
-        grouping::Area,
-        willow::{AuthorisedEntry, NamespaceId},
-    },
-    session::SessionId,
+use crate::proto::{
+    data_model::{AuthorisedEntry, NamespaceId},
+    grouping::Area,
 };
+
+pub type SessionId = u64;
 
 use super::traits::EntryStorage;
 
@@ -60,10 +59,10 @@ impl<ES: EntryStorage> WatchableEntryStore<ES> {
         }
     }
 
-    /// Returns a store reader.
-    pub fn reader(&self) -> ES::Reader {
-        self.storage.reader()
-    }
+    // /// Returns a store reader.
+    // pub fn reader(&self) -> ES::Reader {
+    //     self.storage.reader()
+    // }
 
     /// Returns a store snapshot.
     pub fn snapshot(&self) -> anyhow::Result<ES::Snapshot> {
@@ -149,7 +148,7 @@ impl Broadcaster {
     }
 
     fn broadcast(&mut self, entry: &AuthorisedEntry, origin: EntryOrigin) {
-        let Some(sessions) = self.watched_areas.get_mut(&entry.namespace_id()) else {
+        let Some(sessions) = self.watched_areas.get_mut(entry.entry().namespace_id()) else {
             return;
         };
         let mut dropped_receivers = vec![];

@@ -10,6 +10,33 @@ use iroh_blobs::store::Store as PayloadStore;
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{debug, trace};
 
+use crate::{
+    proto::{
+        data_model::PayloadDigest,
+        grouping::{AreaExt, AreaOfInterest, Range3d},
+        keys::NamespaceId,
+        wgps::{
+            AreaOfInterestHandle, Fingerprint, IsHandle, LengthyEntry,
+            ReconciliationAnnounceEntries, ReconciliationMessage, ReconciliationSendEntry,
+            ReconciliationSendFingerprint, ReconciliationSendPayload,
+            ReconciliationTerminatePayload,
+        },
+    },
+    session::{
+        aoi_finder::AoiIntersection,
+        channels::{ChannelSenders, MessageReceiver},
+        payload::{send_payload_chunked, CurrentPayload, DEFAULT_CHUNK_SIZE},
+        static_tokens::StaticTokens,
+        Error, Role, SessionId,
+    },
+    store::{
+        entry::{EntryChannel, EntryOrigin},
+        traits::{EntryReader, EntryStorage, SplitAction, SplitOpts, Storage},
+        Store,
+    },
+    util::{gen_stream::GenStream, stream::Cancelable},
+};
+
 #[derive(Debug)]
 pub enum Input {
     AoiIntersection(AoiIntersection),
@@ -23,33 +50,6 @@ pub enum Output {
     },
     ReconciledAll,
 }
-
-use crate::{
-    proto::{
-        grouping::{AreaOfInterest, ThreeDRange},
-        keys::NamespaceId,
-        sync::{
-            AreaOfInterestHandle, Fingerprint, IsHandle, LengthyEntry,
-            ReconciliationAnnounceEntries, ReconciliationMessage, ReconciliationSendEntry,
-            ReconciliationSendFingerprint, ReconciliationSendPayload,
-            ReconciliationTerminatePayload,
-        },
-        willow::PayloadDigest,
-    },
-    session::{
-        aoi_finder::AoiIntersection,
-        channels::{ChannelSenders, MessageReceiver},
-        payload::{send_payload_chunked, CurrentPayload},
-        static_tokens::StaticTokens,
-        Error, Role, SessionId,
-    },
-    store::{
-        entry::{EntryChannel, EntryOrigin},
-        traits::{EntryReader, EntryStorage, SplitAction, SplitOpts, Storage},
-        Store,
-    },
-    util::{gen_stream::GenStream, stream::Cancelable},
-};
 
 #[derive(derive_more::Debug)]
 pub struct Reconciler<S: Storage> {
@@ -65,6 +65,7 @@ impl<S: Storage> Reconciler<S> {
     /// Run the [`Reconciler`].
     ///
     /// The returned stream is a generator, so it must be polled repeatedly to progress.
+    #[allow(clippy::too_many_arguments)]
     pub fn run_gen(
         inbox: Cancelable<ReceiverStream<Input>>,
         store: Store<S>,
@@ -73,6 +74,7 @@ impl<S: Storage> Reconciler<S> {
         session_id: SessionId,
         send: ChannelSenders,
         our_role: Role,
+        max_eager_payload_size: u64,
     ) -> impl futures_lite::Stream<Item = Result<Output, Error>> {
         GenStream::new(|co| {
             let shared = Shared {
@@ -82,6 +84,7 @@ impl<S: Storage> Reconciler<S> {
                 send,
                 static_tokens,
                 session_id,
+                max_eager_payload_size,
             };
             Self {
                 shared,
@@ -149,13 +152,13 @@ impl<S: Storage> Reconciler<S> {
                     .shared
                     .static_tokens
                     .authorise_entry_eventually(
-                        message.entry.entry,
+                        message.entry.entry.into(),
                         message.static_token_handle,
                         message.dynamic_token,
                     )
                     .await?;
                 self.current_entry.received_entry(
-                    authorised_entry.entry().payload_digest,
+                    *authorised_entry.entry().payload_digest(),
                     message.entry.available,
                 )?;
                 self.shared.store.entries().ingest(
@@ -366,6 +369,7 @@ struct Shared<S: Storage> {
     send: ChannelSenders,
     static_tokens: StaticTokens,
     session_id: SessionId,
+    max_eager_payload_size: u64,
 }
 
 #[derive(Debug)]
@@ -409,7 +413,7 @@ impl<S: Storage> Target<S> {
     }
 
     async fn initiate(&mut self, shared: &Shared<S>) -> Result<(), Error> {
-        let range = self.intersection.area().into_range();
+        let range = self.intersection.area().to_range();
         let fingerprint = self.snapshot.fingerprint(self.namespace(), &range)?;
         self.send_fingerprint(shared, range, fingerprint, None)
             .await?;
@@ -511,13 +515,13 @@ impl<S: Storage> Target<S> {
     async fn send_fingerprint(
         &mut self,
         shared: &Shared<S>,
-        range: ThreeDRange,
+        range: Range3d,
         fingerprint: Fingerprint,
         covers: Option<u64>,
     ) -> anyhow::Result<()> {
         self.mark_our_next_range_pending();
         let msg = ReconciliationSendFingerprint {
-            range,
+            range: range.into(),
             fingerprint,
             sender_handle: self.intersection.our_handle,
             receiver_handle: self.intersection.their_handle,
@@ -530,7 +534,7 @@ impl<S: Storage> Target<S> {
     async fn announce_and_send_entries(
         &mut self,
         shared: &Shared<S>,
-        range: &ThreeDRange,
+        range: &Range3d,
         want_response: bool,
         covers: Option<u64>,
         our_entry_count: Option<u64>,
@@ -540,7 +544,7 @@ impl<S: Storage> Target<S> {
             None => self.snapshot.count(self.namespace(), range)?,
         };
         let msg = ReconciliationAnnounceEntries {
-            range: range.clone(),
+            range: range.clone().into(),
             count: our_entry_count,
             want_response,
             will_sort: false, // todo: sorted?
@@ -559,14 +563,17 @@ impl<S: Storage> Target<S> {
         {
             let authorised_entry = authorised_entry?;
             let (entry, token) = authorised_entry.into_parts();
-            let (static_token, dynamic_token) = token.into_parts();
+
+            let static_token = token.capability.into();
+            let dynamic_token = token.signature;
             // TODO: partial payloads
-            let available = entry.payload_length;
+            let payload_len = entry.payload_length();
+            let available = payload_len;
             let static_token_handle = shared
                 .static_tokens
                 .bind_and_send_ours(static_token, &shared.send)
                 .await?;
-            let digest = entry.payload_digest;
+            let digest = *entry.payload_digest();
             let msg = ReconciliationSendEntry {
                 entry: LengthyEntry::new(entry, available),
                 static_token_handle,
@@ -575,21 +582,17 @@ impl<S: Storage> Target<S> {
             shared.send.send(msg).await?;
 
             // TODO: only send payload if configured to do so and/or under size limit.
-            let send_payloads = true;
-            let chunk_size = 1024 * 64;
-            if send_payloads
-                && send_payload_chunked(
+            if payload_len <= shared.max_eager_payload_size {
+                send_payload_chunked(
                     digest,
                     shared.store.payloads(),
                     &shared.send,
-                    chunk_size,
+                    DEFAULT_CHUNK_SIZE,
                     |bytes| ReconciliationSendPayload { bytes }.into(),
                 )
-                .await?
-            {
-                let msg = ReconciliationTerminatePayload;
-                shared.send.send(msg).await?;
+                .await?;
             }
+            shared.send.send(ReconciliationTerminatePayload).await?;
         }
         Ok(())
     }
