@@ -85,6 +85,7 @@ pub trait EntryStorage: EntryReader + Clone + Debug + 'static {
     fn reader(&self) -> Self::Reader;
     fn snapshot(&self) -> Result<Self::Snapshot>;
     fn ingest_entry(&self, entry: &AuthorisedEntry) -> Result<bool>;
+    fn remove_entry(&self, entry: &AuthorisedEntry) -> Result<bool>;
 }
 
 /// Read-only interface to [`EntryStorage`].
