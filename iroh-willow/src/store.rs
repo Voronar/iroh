@@ -15,7 +15,8 @@ use crate::{
     form::{AuthForm, EntryForm, EntryOrForm, SubspaceForm, TimestampForm},
     interest::{CapSelector, ReceiverSelector},
     proto::{
-        data_model::{AuthorisedEntry, Entry, PayloadDigest},
+        data_model::Entry,
+        data_model::{AuthorisedEntry, PayloadDigest},
         keys::{NamespaceId, NamespaceKind, NamespaceSecretKey, UserId},
     },
     store::traits::SecretStorage,
@@ -84,38 +85,6 @@ impl<S: Storage> Store<S> {
         &self.auth
     }
 
-    // Some kind of GC for the corresponding payload is required
-    pub async fn remove_entries(&self, entries: Vec<Entry>, auth: AuthForm) -> Result<Vec<bool>> {
-        let user_id = auth.user_id();
-
-        let secret_key = self
-            .secrets()
-            .get_user(&user_id)
-            .context("Missing user keypair")?;
-
-        let mut res = vec![];
-
-        for entry in entries {
-            let capability = match &auth {
-                AuthForm::Exact(cap) => cap.0.clone(),
-                AuthForm::Any(user_id) => {
-                    let selector =
-                        CapSelector::for_entry(&entry, ReceiverSelector::Exact(*user_id));
-                    self.auth()
-                        .get_write_cap(&selector)?
-                        .ok_or_else(|| anyhow!("no write capability available"))?
-                }
-            };
-
-            let token = capability.authorisation_token(&entry, secret_key.clone())?;
-            let authorised_entry = AuthorisedEntry::new_unchecked(entry, token);
-            let is_removed = self.entries().remove(&authorised_entry)?;
-
-            res.push(is_removed);
-        }
-
-        Ok(res)
-    }
     pub async fn insert_entry(&self, entry: EntryOrForm, auth: AuthForm) -> Result<(Entry, bool)> {
         let user_id = auth.user_id();
         let entry = match entry {

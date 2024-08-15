@@ -69,11 +69,6 @@ impl<ES: EntryStorage> WatchableEntryStore<ES> {
         self.storage.snapshot()
     }
 
-    /// Removes the entry from the store.
-    pub fn remove(&self, entry: &AuthorisedEntry) -> anyhow::Result<bool> {
-        Ok(self.storage.remove_entry(entry)?)
-    }
-
     /// Ingest a new entry.
     ///
     /// Returns `true` if the entry was stored, and `false` if the entry already exists or is

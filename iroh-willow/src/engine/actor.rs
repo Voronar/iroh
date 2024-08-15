@@ -137,25 +137,6 @@ impl ActorHandle {
         Ok(rx.into_stream())
     }
 
-    pub async fn remove_entries(
-        &self,
-        entries: Vec<Entry>,
-        auth: impl Into<AuthForm>,
-    ) -> Result<Vec<bool>> {
-        let (reply, reply_rx) = oneshot::channel();
-
-        self.send(Input::RemoveEntries {
-            entries,
-            auth: auth.into(),
-            reply,
-        })
-        .await?;
-
-        let res = reply_rx.await??;
-
-        Ok(res)
-    }
-
     pub(crate) async fn init_session(
         &self,
         conn: ConnHandle,
@@ -278,11 +259,6 @@ pub enum Input {
         range: Range3d,
         #[debug(skip)]
         reply: flume::Sender<Result<Entry>>,
-    },
-    RemoveEntries {
-        auth: AuthForm,
-        entries: Vec<Entry>,
-        reply: oneshot::Sender<Result<Vec<bool>>>,
     },
     IngestEntry {
         authorised_entry: AuthorisedEntry,
@@ -437,14 +413,6 @@ impl<S: Storage> Actor<S> {
                     event_rx,
                 };
                 send_reply(reply, Ok(handle))
-            }
-            Input::RemoveEntries {
-                entries,
-                auth,
-                reply,
-            } => {
-                let res = self.store.remove_entries(entries, auth).await;
-                send_reply(reply, res.map_err(anyhow::Error::from))
             }
             Input::GetEntries {
                 namespace,
