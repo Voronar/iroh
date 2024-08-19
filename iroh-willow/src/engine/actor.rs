@@ -19,7 +19,7 @@ use crate::{
         data_model::{AuthorisedEntry, Entry},
         grouping::Range3d,
         keys::{NamespaceId, NamespaceKind, UserId, UserSecretKey},
-        meadowcap::{self, AccessMode, ReadAuthorisation},
+        meadowcap::{self, AccessMode, McCapability, ReadAuthorisation},
     },
     session::{intents::Intent, run_session, Error, EventSender, SessionHandle},
     store::{
@@ -219,6 +219,12 @@ impl ActorHandle {
         reply_rx.await?
     }
 
+    pub async fn del_caps(&self, selector: CapSelector) -> Result<Vec<McCapability>> {
+        let (reply, reply_rx) = oneshot::channel();
+        self.send(Input::DeleteCaps { selector, reply }).await?;
+        reply_rx.await?
+    }
+
     pub async fn resolve_interests(&self, interests: Interests) -> Result<InterestMap> {
         let (reply, reply_rx) = oneshot::channel();
         self.send(Input::ResolveInterests { interests, reply })
@@ -295,6 +301,10 @@ pub enum Input {
     ImportCaps {
         caps: Vec<CapabilityPack>,
         reply: oneshot::Sender<Result<()>>,
+    },
+    DeleteCaps {
+        selector: CapSelector,
+        reply: oneshot::Sender<Result<Vec<McCapability>>>,
     },
     ListReadCaps {
         reply: oneshot::Sender<Result<Vec<ReadAuthorisation>>>,
@@ -477,6 +487,10 @@ impl<S: Storage> Actor<S> {
             }
             Input::ImportCaps { caps, reply } => {
                 let res = self.store.auth().import_caps(caps);
+                send_reply(reply, res.map_err(anyhow::Error::from))
+            }
+            Input::DeleteCaps { selector, reply } => {
+                let res = self.store.auth().del_caps(&selector);
                 send_reply(reply, res.map_err(anyhow::Error::from))
             }
             Input::ListReadCaps { reply } => {

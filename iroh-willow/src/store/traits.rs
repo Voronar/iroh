@@ -10,7 +10,7 @@ use crate::{
         data_model::{AuthorisedEntry, Entry, NamespaceId, WriteCapability},
         grouping::Range3d,
         keys::{NamespaceSecretKey, NamespaceSignature, UserId, UserSecretKey, UserSignature},
-        meadowcap::{self, ReadAuthorisation},
+        meadowcap::{self, McCapability, ReadAuthorisation},
         wgps::Fingerprint,
     },
 };
@@ -171,6 +171,7 @@ pub trait CapsStorage: Debug + Clone {
     ) -> Result<impl Iterator<Item = WriteCapability> + '_>;
 
     fn get_write_cap(&self, selector: &CapSelector) -> Result<Option<WriteCapability>>;
+    fn del_caps(&self, selector: &CapSelector) -> Result<Vec<McCapability>>;
 
     fn get_read_cap(&self, selector: &CapSelector) -> Result<Option<ReadAuthorisation>>;
 }

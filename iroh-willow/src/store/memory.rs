@@ -17,7 +17,7 @@ use crate::{
         data_model::{AuthorisedEntry, Entry, EntryExt, WriteCapability},
         grouping::{Range, Range3d, RangeEnd},
         keys::{NamespaceId, NamespaceSecretKey, UserId, UserSecretKey},
-        meadowcap::{self, is_wider_than, ReadAuthorisation},
+        meadowcap::{self, is_wider_than, McCapability, ReadAuthorisation},
         wgps::Fingerprint,
     },
     store::traits::{self, RangeSplit, SplitAction, SplitOpts},
@@ -270,6 +270,51 @@ pub struct CapsStore {
 }
 
 impl CapsStore {
+    fn del_caps(&mut self, selector: &CapSelector) -> Result<Vec<McCapability>> {
+        let mut deleted = vec![];
+
+        self.write_caps
+            .entry(selector.namespace_id)
+            .and_modify(|caps| {
+                let mut removed_indexes = caps
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, cap)| {
+                        if selector.is_covered_by(cap) {
+                            Some(i)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect::<Vec<_>>();
+
+                while let Some(i) = removed_indexes.pop() {
+                    deleted.push(caps.remove(i));
+                }
+            });
+
+        self.read_caps
+            .entry(selector.namespace_id)
+            .and_modify(|caps| {
+                let mut removed_indexes = caps
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, cap)| {
+                        if selector.is_covered_by(cap.read_cap()) {
+                            Some(i)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect::<Vec<_>>();
+
+                while let Some(i) = removed_indexes.pop() {
+                    deleted.push(caps.remove(i).read_cap().clone());
+                }
+            });
+
+        Ok(deleted)
+    }
     fn get_write_cap(&self, selector: &CapSelector) -> Result<Option<WriteCapability>> {
         let candidates = self
             .write_caps
@@ -365,6 +410,10 @@ impl traits::CapsStorage for Rc<RefCell<CapsStore>> {
         namespace: Option<NamespaceId>,
     ) -> Result<impl Iterator<Item = ReadAuthorisation>> {
         self.borrow().list_read_caps(namespace)
+    }
+
+    fn del_caps(&self, selector: &CapSelector) -> Result<Vec<McCapability>> {
+        self.borrow_mut().del_caps(selector)
     }
 
     fn list_write_caps(
