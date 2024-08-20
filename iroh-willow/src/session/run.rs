@@ -1,12 +1,15 @@
 use std::{future::Future, sync::Arc};
 
-use futures_concurrency::{future::TryJoin, stream::StreamExt as _};
+use futures_concurrency::{
+    future::{Join as _, TryJoin as _},
+    stream::StreamExt as _,
+};
 use futures_lite::StreamExt as _;
 use strum::IntoEnumIterator;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error_span, trace, warn, Instrument, Span};
+use tracing::{debug, error_span, trace, Instrument, Span};
 
 use crate::{
     net::ConnHandle,
@@ -23,13 +26,15 @@ use crate::{
         Channels, Error, EventSender, Role, SessionEvent, SessionId, SessionUpdate,
     },
     store::{traits::Storage, Store},
-    util::{channel::Receiver, stream::Cancelable},
+    util::{
+        channel::Receiver,
+        stream::{Cancelable, CancelableReceiver},
+    },
 };
 
 use super::{
     channels::ChannelReceivers,
     data::{DataReceiver, DataSender},
-    error::ChannelReceiverDropped,
     reconciler::Reconciler,
     SessionMode,
 };
@@ -40,7 +45,6 @@ pub(crate) async fn run_session<S: Storage>(
     store: Store<S>,
     conn: ConnHandle,
     initial_intents: Vec<Intent>,
-    cancel_token: CancellationToken,
     session_id: SessionId,
     event_sender: EventSender,
     update_receiver: ReceiverStream<SessionUpdate>,
@@ -80,15 +84,15 @@ pub(crate) async fn run_session<S: Storage>(
 
     debug!(role = ?our_role, ?mode, "start session");
 
-    // Make all our receivers close once the cancel_token is triggered.
-    let control_recv = Cancelable::new(control_recv, cancel_token.clone());
-    let reconciliation_recv = Cancelable::new(reconciliation_recv, cancel_token.clone());
-    let intersection_recv = Cancelable::new(intersection_recv, cancel_token.clone());
-    let mut static_tokens_recv = Cancelable::new(static_tokens_recv, cancel_token.clone());
-    let mut capability_recv = Cancelable::new(capability_recv, cancel_token.clone());
-    let mut aoi_recv = Cancelable::new(aoi_recv, cancel_token.clone());
-    let mut data_recv = Cancelable::new(data_recv, cancel_token.clone());
-    let mut update_receiver = Cancelable::new(update_receiver, cancel_token.clone());
+    // Make all our receivers close once the close session token is triggered.
+    let close_session_token = CancellationToken::new();
+    let control_recv = Cancelable::new(control_recv, close_session_token.clone());
+    let reconciliation_recv = Cancelable::new(reconciliation_recv, close_session_token.clone());
+    let intersection_recv = Cancelable::new(intersection_recv, close_session_token.clone());
+    let mut static_tokens_recv = Cancelable::new(static_tokens_recv, close_session_token.clone());
+    let mut capability_recv = Cancelable::new(capability_recv, close_session_token.clone());
+    let mut aoi_recv = Cancelable::new(aoi_recv, close_session_token.clone());
+    let mut data_recv = Cancelable::new(data_recv, close_session_token.clone());
 
     let caps = Capabilities::new(
         initial_transmission.our_nonce,
@@ -97,40 +101,51 @@ pub(crate) async fn run_session<S: Storage>(
     let tokens = StaticTokens::default();
 
     // Setup channels for communication between the loops.
-    let (pai_inbox, pai_inbox_rx) = cancelable_channel::<pai::Input>(2, cancel_token.clone());
+    // All channels but the intents channel are "cancelable", which means that once the cancel
+    // token is invoked, no new messages may be sent into the channel.
+    let close_inboxes_token = CancellationToken::new();
+    let mut update_receiver = CancelableReceiver::new(update_receiver, close_inboxes_token.clone());
+    let (pai_inbox, pai_inbox_rx) =
+        cancelable_channel::<pai::Input>(2, close_inboxes_token.clone());
     let (intersection_inbox, intersection_inbox_rx) =
-        cancelable_channel::<aoi_finder::Input>(2, cancel_token.clone());
+        cancelable_channel::<aoi_finder::Input>(2, close_inboxes_token.clone());
     let (reconciler_inbox, reconciler_inbox_rx) =
-        cancelable_channel::<reconciler::Input>(2, cancel_token.clone());
-    let (intents_inbox, intents_inbox_rx) =
-        cancelable_channel::<intents::Input>(2, cancel_token.clone());
+        cancelable_channel::<reconciler::Input>(2, close_inboxes_token.clone());
+
+    // The closing ceremony for the intents inbox is more involved: It is a regular channel,
+    // because the inbox should stay open after the cancel token is triggered, so that further
+    // events may still be emitted. To close the channel, we manually ensure that all senders are
+    // dropped once all other work is done.
+    let (intents_inbox, intents_inbox_rx) = channel::<intents::Input>(2);
 
     // Setup data channels only if in live mode.
     // TODO: Adapt to changing mode.
     let (data_inbox, data_inbox_rx) = if mode == SessionMode::Continuous {
         let (data_inbox, data_inbox_rx) =
-            cancelable_channel::<data::Input>(2, cancel_token.clone());
+            cancelable_channel::<data::Input>(2, close_inboxes_token.clone());
         (Some(data_inbox), Some(data_inbox_rx))
     } else {
         (None, None)
     };
 
-    let mut intents = intents::IntentDispatcher::new(store.auth().clone(), initial_intents);
+    let mut intents =
+        intents::IntentDispatcher::new(store.auth().clone(), initial_intents, intents_inbox_rx);
     let intents_fut = with_span(error_span!("intents"), async {
         use intents::Output;
-        let mut intents_gen = intents.run_gen(intents_inbox_rx);
+        let mut intents_gen = intents.run_gen();
         while let Some(output) = intents_gen.try_next().await? {
             trace!(?output, "yield");
             match output {
                 Output::SubmitInterests(interests) => {
                     intersection_inbox
                         .send(aoi_finder::Input::AddInterests(interests))
-                        .await?;
+                        .await
+                        .ok();
                 }
                 // TODO: Add Output::SetMode(SessionMode) to propagate mode changes.
                 Output::AllIntentsDropped => {
                     debug!("close session (all intents dropped)");
-                    cancel_token.cancel();
+                    close_session_token.cancel();
                 }
             }
         }
@@ -164,19 +179,29 @@ pub(crate) async fn run_session<S: Storage>(
         }
     });
 
+    let mut abort_err = None;
+
+    let intents_inbox_2 = intents_inbox.clone();
     let update_loop = with_span(error_span!("update"), async {
         while let Some(update) = update_receiver.next().await {
             match update {
                 SessionUpdate::SubmitIntent(data) => {
-                    intents_inbox
+                    intents_inbox_2
                         .send(intents::Input::SubmitIntent(data))
                         .await?;
                 }
+                SessionUpdate::Abort(err) => {
+                    abort_err = Some(err);
+                    close_session_token.cancel();
+                    break;
+                }
             }
         }
+        drop(intents_inbox_2);
         Ok(())
     });
 
+    let intents_inbox_2 = intents_inbox.clone();
     let intersection_loop = with_span(error_span!("intersection"), async {
         use aoi_finder::Output;
         let mut gen = IntersectionFinder::run_gen(caps.clone(), intersection_inbox_rx);
@@ -186,20 +211,25 @@ pub(crate) async fn run_session<S: Storage>(
                 Output::SubmitAuthorisation(authorisation) => {
                     pai_inbox
                         .send(pai::Input::SubmitAuthorisation(authorisation))
-                        .await?;
+                        .await
+                        .ok();
                 }
                 Output::AoiIntersection(intersection) => {
                     let area = intersection.intersection.clone();
                     let namespace = intersection.namespace;
                     reconciler_inbox
                         .send(reconciler::Input::AoiIntersection(intersection.clone()))
-                        .await?;
+                        .await
+                        .ok();
                     let event = EventKind::InterestIntersection { namespace, area };
-                    intents_inbox.send(intents::Input::EmitEvent(event)).await?;
+                    intents_inbox_2
+                        .send(intents::Input::EmitEvent(event))
+                        .await?;
                     if let Some(data_inbox) = &data_inbox {
                         data_inbox
                             .send(data::Input::AoiIntersection(intersection.clone()))
-                            .await?;
+                            .await
+                            .ok();
                     }
                 }
                 Output::SignAndSendCapability { handle, capability } => {
@@ -208,9 +238,11 @@ pub(crate) async fn run_session<S: Storage>(
                 }
             }
         }
+        drop(intents_inbox_2);
         Ok(())
     });
 
+    let intents_inbox_2 = intents_inbox.clone();
     let pai_loop = with_span(error_span!("pai"), async {
         use pai::Output;
         let inbox = pai_inbox_rx.merge(intersection_recv.map(pai::Input::ReceivedMessage));
@@ -223,12 +255,12 @@ pub(crate) async fn run_session<S: Storage>(
                         namespace: intersection.authorisation.namespace(),
                         area: intersection.authorisation.read_cap().granted_area().clone(),
                     };
-                    (
+                    let _ = (
                         intersection_inbox.send(aoi_finder::Input::PaiIntersection(intersection)),
-                        intents_inbox.send(intents::Input::EmitEvent(event)),
+                        intents_inbox_2.send(intents::Input::EmitEvent(event)),
                     )
-                        .try_join()
-                        .await?;
+                        .join()
+                        .await;
                 }
                 Output::SignAndSendSubspaceCap(handle, cap) => {
                     let message = caps.sign_subspace_capability(store.secrets(), cap, handle)?;
@@ -236,9 +268,11 @@ pub(crate) async fn run_session<S: Storage>(
                 }
             }
         }
+        drop(intents_inbox_2);
         Ok(())
     });
 
+    let intents_inbox_2 = intents_inbox.clone();
     let reconciler_loop = with_span(error_span!("reconciler"), async {
         use reconciler::Output;
         let mut gen = Reconciler::run_gen(
@@ -254,7 +288,7 @@ pub(crate) async fn run_session<S: Storage>(
         while let Some(output) = gen.try_next().await? {
             match output {
                 Output::ReconciledArea { namespace, area } => {
-                    intents_inbox
+                    intents_inbox_2
                         .send(intents::Input::EmitEvent(EventKind::Reconciled {
                             namespace,
                             area,
@@ -265,12 +299,13 @@ pub(crate) async fn run_session<S: Storage>(
                     // Stop session if not in live mode;
                     if !mode.is_live() {
                         debug!("close session (reconciliation finished and not in live mode)");
-                        cancel_token.cancel();
+                        close_session_token.cancel();
                         break;
                     }
                 }
             }
         }
+        drop(intents_inbox_2);
         Ok(())
     });
 
@@ -287,12 +322,11 @@ pub(crate) async fn run_session<S: Storage>(
             caps.validate_and_bind_theirs(message.capability.0, message.signature)?;
             pai_inbox
                 .send(pai::Input::ReceivedReadCapForIntersection(handle))
-                .await?;
+                .await
+                .ok();
         }
         Ok(())
     });
-
-    let mut we_cancelled = false;
 
     let control_loop = with_span(error_span!("control"), async {
         let res = control_loop(
@@ -304,12 +338,8 @@ pub(crate) async fn run_session<S: Storage>(
             &event_sender,
         )
         .await;
-        if !cancel_token.is_cancelled() {
-            debug!("close session (closed by peer)");
-            cancel_token.cancel();
-        } else {
-            we_cancelled = true;
-        }
+        // Once the control loop closed, close the inboxes.
+        close_inboxes_token.cancel();
         res
     });
 
@@ -330,10 +360,16 @@ pub(crate) async fn run_session<S: Storage>(
                     namespace,
                     aoi: area_of_interest,
                 })
-                .await?;
+                .await
+                .ok();
         }
         Ok(())
     });
+
+    // Drop the intents_inbox. We cloned this into the different loops, and the clones are dropped
+    // at the end of the loops - which means the intents loop will terminate once all other loops
+    // that potentially send into the intents inbox.
+    drop(intents_inbox);
 
     let result = (
         intents_fut,
@@ -353,22 +389,50 @@ pub(crate) async fn run_session<S: Storage>(
     // Unsubscribe from the store.
     store.entries().unsubscribe(&session_id);
 
-    let result = result.map_err(Arc::new).map(|_| ());
+    // Track if we closed the session by triggering the cancel token, or if the remote peer closed
+    // the session by closing the control channel.
+    let we_cancelled = close_session_token.is_cancelled();
 
-    debug!(error=?result.as_ref().err(), ?we_cancelled, "session complete");
+    // Close the update receiver channel.
+    let mut update_receiver = update_receiver.into_inner().into_inner();
+    update_receiver.close();
+
+    // Drain incomplete intents that are still in the intent dispatcher.
+    let mut remaining_intents = intents.drain_all().await;
+
+    // Drain the update receiver channel.
+    while let Some(update) = update_receiver.recv().await {
+        match update {
+            SessionUpdate::SubmitIntent(intent) => remaining_intents.queued.push(intent),
+            SessionUpdate::Abort(err) => {
+                abort_err = Some(err);
+            }
+        }
+    }
+
+    let result = match (result, abort_err) {
+        (_, Some(err)) => Err(Arc::new(err)),
+        (Err(err), None) => Err(Arc::new(err)),
+        _ => Ok(()),
+    };
 
     let remaining_intents = match result.as_ref() {
-        Ok(()) => {
-            // If the session closed without an error, return the remaining intents
-            // so that they can potentially be restarted.
-            intents.drain_all()
-        }
         Err(err) => {
-            // If the session closed with error, abort the intents with that error.
-            intents.abort_all(err.clone()).await;
+            remaining_intents.abort_all(err.clone()).await;
             vec![]
         }
+        Ok(()) if we_cancelled => {
+            drop(remaining_intents.active_incomplete);
+            remaining_intents.queued
+        }
+        Ok(()) => {
+            remaining_intents
+                .abort_active(Arc::new(Error::SessionClosedByPeer))
+                .await
+        }
     };
+
+    debug!(error=?result.as_ref().err(), remaining_intents=remaining_intents.len(), ?we_cancelled, "session complete");
 
     if let Err(_receiver_dropped) = event_sender
         .send(SessionEvent::Complete {
@@ -376,11 +440,10 @@ pub(crate) async fn run_session<S: Storage>(
             we_cancelled,
             senders: channel_sender,
             remaining_intents,
-            update_receiver: update_receiver.into_inner().into_inner(),
         })
         .await
     {
-        warn!("failed to send session complete event: receiver dropped");
+        debug!("failed to send session complete event: receiver dropped");
     }
 
     result
@@ -391,7 +454,7 @@ async fn control_loop(
     our_role: Role,
     caps: &Capabilities,
     sender: &ChannelSenders,
-    pai_inbox: &Sender<pai::Input>,
+    pai_inbox: &mpsc::Sender<pai::Input>,
     event_sender: &EventSender,
 ) -> Result<(), Error> {
     // Reveal our nonce.
@@ -443,34 +506,25 @@ async fn control_loop(
             _ => return Err(Error::UnsupportedMessage),
         }
     }
+    trace!("control loop closing");
 
     Ok(())
+}
+
+fn channel<T: Send + 'static>(cap: usize) -> (mpsc::Sender<T>, mpsc::Receiver<T>) {
+    let (tx, rx) = mpsc::channel(cap);
+    (tx, rx)
 }
 
 fn cancelable_channel<T: Send + 'static>(
     cap: usize,
     cancel_token: CancellationToken,
-) -> (Sender<T>, Cancelable<ReceiverStream<T>>) {
+) -> (mpsc::Sender<T>, CancelableReceiver<T>) {
     let (tx, rx) = mpsc::channel(cap);
     (
-        Sender(tx),
-        Cancelable::new(ReceiverStream::new(rx), cancel_token),
+        tx,
+        CancelableReceiver::new(ReceiverStream::new(rx), cancel_token),
     )
-}
-
-#[derive(Debug)]
-pub struct Sender<T>(mpsc::Sender<T>);
-
-impl<T> Clone for Sender<T> {
-    fn clone(&self) -> Self {
-        Self(self.0.clone())
-    }
-}
-
-impl<T: Send> Sender<T> {
-    async fn send(&self, item: T) -> Result<(), ChannelReceiverDropped> {
-        self.0.send(item).await.map_err(|_| ChannelReceiverDropped)
-    }
 }
 
 async fn with_span<T: std::fmt::Debug>(

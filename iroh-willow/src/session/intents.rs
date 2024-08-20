@@ -268,8 +268,42 @@ pub(super) enum Output {
     AllIntentsDropped,
 }
 
+#[derive(Debug)]
+pub(crate) struct RemainingIntents {
+    pub(crate) active_incomplete: Vec<Sender<EventKind>>,
+    pub(crate) queued: Vec<Intent>,
+}
+
+impl RemainingIntents {
+    /// Abort both incomplete active and queued unprocessed intents.
+    pub async fn abort_all(self, error: Arc<Error>) {
+        let futs = Iterator::chain(
+            self.queued
+                .into_iter()
+                .flat_map(|intent| intent.channels.map(|ch| ch.event_tx)),
+            self.active_incomplete,
+        )
+        .map(|event_tx| {
+            let error = error.clone();
+            async move { event_tx.send(EventKind::Abort { error }).await }
+        });
+        let _ = futures_buffered::join_all(futs).await;
+    }
+
+    /// Abort incomplete active intents, and return queued unprocessed intents.
+    pub async fn abort_active(self, error: Arc<Error>) -> Vec<Intent> {
+        let futs = self.active_incomplete.into_iter().map(|event_tx| {
+            let error = error.clone();
+            async move { event_tx.send(EventKind::Abort { error }).await }
+        });
+        let _ = futures_buffered::join_all(futs).await;
+        self.queued
+    }
+}
+
 #[derive(derive_more::Debug)]
 pub(super) struct IntentDispatcher<S: Storage> {
+    inbox: mpsc::Receiver<Input>,
     pending_intents: VecDeque<Intent>,
     intents: HashMap<IntentId, IntentInfo>,
     auth: Auth<S>,
@@ -280,8 +314,13 @@ pub(super) struct IntentDispatcher<S: Storage> {
 }
 
 impl<S: Storage> IntentDispatcher<S> {
-    pub(super) fn new(auth: Auth<S>, initial_intents: impl IntoIterator<Item = Intent>) -> Self {
+    pub(super) fn new(
+        auth: Auth<S>,
+        initial_intents: impl IntoIterator<Item = Intent>,
+        inbox: mpsc::Receiver<Input>,
+    ) -> Self {
         Self {
+            inbox,
             pending_intents: initial_intents.into_iter().collect(),
             intents: Default::default(),
             auth,
@@ -291,53 +330,31 @@ impl<S: Storage> IntentDispatcher<S> {
         }
     }
 
-    /// Aborts all registered intents.
-    pub(super) async fn abort_all(&self, error: Arc<Error>) {
-        let _ = futures_buffered::join_all(
-            Iterator::chain(
-                self.pending_intents
-                    .iter()
-                    .flat_map(|intent| intent.channels.as_ref())
-                    .map(|ch| &ch.event_tx),
-                self.intents
-                    .values()
-                    .flat_map(|intent| intent.event_tx.as_ref()),
-            )
-            .map(|event_tx| {
-                let error = error.clone();
-                async move { event_tx.send(EventKind::Abort { error }).await }
-            }),
-        )
-        .await;
-    }
+    pub(super) async fn drain_all(mut self) -> RemainingIntents {
+        let mut queued = vec![];
 
-    /// Takes self and returns all pending intents.
-    // TODO: What if one of the two channels closed?
-    // Should not do Option<IntentChannels> but an option for each direction instead likely on Intent.
-    pub(super) fn drain_all(mut self) -> Vec<Intent> {
-        let mut intents: Vec<_> = self.pending_intents.into_iter().collect();
-        for (id, info) in self.intents.drain() {
-            let event_tx = info.event_tx;
-            let update_rx = self.intent_update_rx.remove(&id);
-            let update_rx = update_rx
-                .and_then(|stream| stream.into_inner())
-                .map(|stream| stream.into_inner());
-            let channels = match (event_tx, update_rx) {
-                (Some(event_tx), Some(update_rx)) => Some(IntentChannels {
-                    event_tx,
-                    update_rx,
-                }),
-                _ => None,
-            };
-            if let Some(channels) = channels {
-                let intent = Intent {
-                    init: info.original_init,
-                    channels: Some(channels),
-                };
-                intents.push(intent);
+        // Drain inbox.
+        self.inbox.close();
+        while let Some(item) = self.inbox.recv().await {
+            match item {
+                Input::EmitEvent(event) => self.emit_event_inner(event).await,
+                Input::SubmitIntent(intent) => queued.push(intent),
             }
         }
-        intents
+
+        // Drain pending intents.
+        queued.extend(self.pending_intents.into_iter());
+
+        // Drain incomplete active intents
+        let active_incomplete = self
+            .intents
+            .drain()
+            .filter_map(|(_id, info)| (!info.is_complete()).then_some(info.event_tx).flatten());
+
+        RemainingIntents {
+            queued,
+            active_incomplete: active_incomplete.collect(),
+        }
     }
 
     /// Run the [`IntentDispatcher`].
@@ -345,21 +362,18 @@ impl<S: Storage> IntentDispatcher<S> {
     /// The returned stream is a generator, so it must be polled repeatedly to progress.
     pub(super) fn run_gen(
         &mut self,
-        inbox: impl Stream<Item = Input> + 'static,
     ) -> GenStream<Output, Error, impl Future<Output = Result<(), Error>> + '_> {
-        GenStream::new(|co| self.run(co, inbox))
+        GenStream::new(|co| self.run(co))
     }
 
-    async fn run(&mut self, co: Co<Output>, inbox: impl Stream<Item = Input>) -> Result<(), Error> {
-        tokio::pin!(inbox);
-
+    async fn run(&mut self, co: Co<Output>) -> Result<(), Error> {
         while let Some(intent) = self.pending_intents.pop_front() {
             self.submit_intent(&co, intent).await?;
         }
         trace!("submitted initial intents, start loop");
         loop {
             tokio::select! {
-                input = inbox.next() => {
+                input = self.inbox.recv() => {
                     trace!(?input, "tick: inbox");
                     let Some(input) = input else {
                         break;
@@ -395,6 +409,7 @@ impl<S: Storage> IntentDispatcher<S> {
     }
 
     async fn submit_intent(&mut self, co: &Co<Output>, intent: Intent) -> Result<(), Error> {
+        debug!("submit intent");
         let interests = self.auth.resolve_interests(intent.init.interests.clone())?;
         let intent_id = {
             let intent_id = self.next_intent_id;
@@ -413,7 +428,6 @@ impl<S: Storage> IntentDispatcher<S> {
             interests: flatten_interests(&interests),
             mode: intent.init.mode,
             event_tx,
-            original_init: intent.init,
         };
         // Send out reconciled events for already-complete areas.
         for (namespace, areas) in &self.complete_areas {
@@ -436,7 +450,7 @@ impl<S: Storage> IntentDispatcher<S> {
         Ok(())
     }
 
-    async fn emit_event(&mut self, co: &Co<Output>, event: EventKind) {
+    async fn emit_event_inner(&mut self, event: EventKind) {
         if let EventKind::Reconciled { namespace, area } = &event {
             self.complete_areas
                 .entry(*namespace)
@@ -452,15 +466,22 @@ impl<S: Storage> IntentDispatcher<S> {
             match res {
                 Err(ChannelReceiverDropped) => {
                     if !self.intent_update_rx.contains_key(&id) {
-                        self.cancel_intent(co, id).await;
+                        self.cancel_intent_inner(id);
                     }
                 }
                 Ok(is_complete) => {
                     if is_complete {
-                        self.cancel_intent(co, id).await;
+                        self.cancel_intent_inner(id);
                     }
                 }
             }
+        }
+    }
+
+    async fn emit_event(&mut self, co: &Co<Output>, event: EventKind) {
+        self.emit_event_inner(event).await;
+        if self.intents.is_empty() {
+            co.yield_(Output::AllIntentsDropped).await;
         }
     }
 
@@ -487,10 +508,14 @@ impl<S: Storage> IntentDispatcher<S> {
         Ok(())
     }
 
-    async fn cancel_intent(&mut self, co: &Co<Output>, intent_id: u64) {
+    fn cancel_intent_inner(&mut self, intent_id: u64) {
         trace!(?intent_id, "cancel intent");
         self.intent_update_rx.remove(&intent_id);
         self.intents.remove(&intent_id);
+    }
+
+    async fn cancel_intent(&mut self, co: &Co<Output>, intent_id: u64) {
+        self.cancel_intent_inner(intent_id);
         if self.intents.is_empty() {
             co.yield_(Output::AllIntentsDropped).await;
         }
@@ -499,7 +524,6 @@ impl<S: Storage> IntentDispatcher<S> {
 
 #[derive(Debug)]
 pub(super) struct IntentInfo {
-    original_init: SessionInit,
     interests: NamespaceInterests,
     mode: SessionMode,
     event_tx: Option<Sender<EventKind>>,
@@ -593,7 +617,10 @@ impl IntentInfo {
         if matches {
             self.send(event.clone()).await?;
             if is_reconciled && self.interests.is_empty() {
+                debug!("SEND RECONCILED ALL");
                 self.send(EventKind::ReconciledAll).await?
+            } else {
+                debug!("DO NOT SEND RECONCILED ALL");
             }
         }
         Ok(self.is_complete())

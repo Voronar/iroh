@@ -8,7 +8,6 @@ use tokio::{
     sync::{mpsc, oneshot},
     task::JoinSet,
 };
-use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, error_span, trace, warn, Instrument};
 
 use crate::{
@@ -408,7 +407,6 @@ impl<S: Storage> Actor<S> {
             } => {
                 let session_id = self.next_session_id();
                 let store = self.store.clone();
-                let cancel_token = CancellationToken::new();
 
                 let (update_tx, update_rx) = mpsc::channel(SESSION_UPDATE_CHANNEL_CAP);
                 let (event_tx, event_rx) = mpsc::channel(SESSION_EVENT_CHANNEL_CAP);
@@ -419,7 +417,6 @@ impl<S: Storage> Actor<S> {
                     store,
                     conn,
                     intents,
-                    cancel_token.clone(),
                     session_id,
                     EventSender(event_tx),
                     update_rx,
@@ -433,7 +430,6 @@ impl<S: Storage> Actor<S> {
                 });
 
                 let handle = SessionHandle {
-                    cancel_token,
                     update_tx,
                     event_rx,
                 };

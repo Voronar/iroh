@@ -157,7 +157,7 @@ impl PeerManager {
                         Input::SubmitIntent { peer, intent } => self.submit_intent(peer, intent).await,
                         Input::HandleConnection { conn } => self.handle_connection(conn).await,
                         Input::Shutdown { reply } => {
-                            self.init_shutdown();
+                            self.init_shutdown().await;
                             if self.conn_tasks.is_empty() {
                                 reply.send(()).ok();
                                 break;
@@ -264,8 +264,7 @@ impl PeerManager {
                     ref mut intents, ..
                 }
                 | PeerState::Closing {
-                    new_intents: ref mut intents,
-                    ..
+                    ref mut intents, ..
                 } => std::mem::take(intents),
                 _ => vec![],
             };
@@ -342,14 +341,22 @@ impl PeerManager {
             } => {
                 intents.push(intent);
             }
-            PeerState::Active { ref update_tx, .. } => {
+            PeerState::Active {
+                ref update_tx,
+                ref mut intents_after_close,
+                ..
+            } => {
                 if let Err(err) = update_tx.send(SessionUpdate::SubmitIntent(intent)).await {
-                    let SessionUpdate::SubmitIntent(intent) = err.0;
-                    intent.send_abort(Arc::new(Error::ActorFailed)).await;
+                    debug!("failed to submit intent into active session, queue in peer state");
+                    if let SessionUpdate::SubmitIntent(intent) = err.0 {
+                        intents_after_close.push(intent);
+                    }
+                } else {
+                    trace!("intent sent to session");
                 }
             }
             PeerState::Closing {
-                ref mut new_intents,
+                intents: ref mut new_intents,
                 ..
             } => {
                 new_intents.push(intent);
@@ -364,36 +371,32 @@ impl PeerManager {
             SessionEvent::Complete {
                 result,
                 senders,
-                remaining_intents,
-                mut update_receiver,
-                ..
+                mut remaining_intents,
+                we_cancelled: _,
             } => {
-                trace!(error=?result.err(), ?remaining_intents, "session complete");
+                debug!(error=?result.err(), remaining_intents=remaining_intents.len(), "session complete");
 
                 // Close the channel senders. This will cause our send loops to close,
                 // which in turn causes the receive loops of the other peer to close.
                 senders.close_all();
 
                 let Some(peer_info) = self.peers.get_mut(&peer) else {
-                    warn!("got session complete for unknown peer");
+                    warn!("got session complete event for unknown peer");
                     return;
                 };
 
-                // TODO(frando): How exactly to deal with the `remaining_intents` is tbd.
-                // Current impl: We store them in the Closing state, wait if the connection closed with error or not,
-                // and if it closed with error abort them with this error, otherwise they are dropped (which also closes their event streams).
-                // We could potentially restart them, as we do with the new intents that came in after session termination,
-                // but we'd have to think carefully about endless loops there.
+                let PeerState::Active {
+                    ref mut intents_after_close,
+                    ..
+                } = peer_info.state
+                else {
+                    warn!("got session complete event for peer not in active state");
+                    return;
+                };
+                remaining_intents.append(intents_after_close);
 
-                // However, the intents that are still in the update channel are completely unprocessed, so they
-                // should get their chance via a reconnect.
-                let mut new_intents = vec![];
-                while let Ok(SessionUpdate::SubmitIntent(intent)) = update_receiver.try_recv() {
-                    new_intents.push(intent);
-                }
                 peer_info.state = PeerState::Closing {
-                    old_intents: remaining_intents,
-                    new_intents,
+                    intents: remaining_intents,
                 };
                 trace!("entering closing state");
             }
@@ -411,7 +414,6 @@ impl PeerManager {
             .peers
             .get_mut(&peer)
             .context("got conn task output for unknown peer")?;
-        trace!(out=?out.as_ref().map(|o| format!("{o}")), "conn task output");
         match out {
             Err(err) => {
                 trace!(?our_role, current_state=%peer_info.state, "conn task failed: {err:#?}");
@@ -445,33 +447,25 @@ impl PeerManager {
                                 )
                                 .await;
                             }
-                            PeerState::Closing {
-                                old_intents,
-                                new_intents,
-                            } => {
+                            PeerState::Closing { intents } => {
                                 debug!(?err, "connection failed to close gracefully");
                                 // If we were are in closing state, we still forward the connection error to the intents.
                                 // This would be the place where we'd implement retries: instead of aborting the intents, resubmit them.
                                 // Right now, we only resubmit intents that were submitted while terminating a session, and only if the session closed gracefully.
                                 let err = Arc::new(Error::Net(err));
                                 join_all(
-                                    old_intents
+                                    intents
                                         .into_iter()
-                                        .chain(new_intents.into_iter())
                                         .map(|intent| intent.send_abort(err.clone())),
                                 )
                                 .await;
                             }
-                            PeerState::Active { .. } => {
-                                // We do not care about intents here, they will be handled in the
-                                // session (which will error as well because all channels are now
-                                // closed).
+                            PeerState::Active { update_tx, .. } => {
                                 warn!(?err, "connection failed while active");
-                                // TODO:(Frando): Not sure if this is good practice?
-                                // A `debug_assert` is far too much, because this can be triggered by other peers.
-                                // However in tests I want to make sure that *all* connections terminate gracefully.
-                                #[cfg(test)]
-                                panic!("connection failed: {err:?}");
+                                update_tx
+                                    .send(SessionUpdate::Abort(Error::ConnectionClosed(err)))
+                                    .await
+                                    .ok();
                             }
                             PeerState::None => {
                                 warn!(?err, "connection failed while peer is in None state");
@@ -489,6 +483,10 @@ impl PeerManager {
                     ref mut intents, ..
                 } = &mut peer_info.state
                 else {
+                    debug!(
+                        ?our_role,
+                        "got connection ready for peer in non-pending state"
+                    );
                     conn.close(ERROR_CODE_FAIL, b"invalid-state");
                     drop(conn);
                     // TODO: unreachable?
@@ -530,7 +528,6 @@ impl PeerManager {
                 let abort_handle = spawn_conn_task(&mut self.conn_tasks, peer_info, fut);
 
                 let SessionHandle {
-                    cancel_token,
                     update_tx,
                     event_rx,
                 } = session_handle;
@@ -539,7 +536,7 @@ impl PeerManager {
 
                 peer_info.state = PeerState::Active {
                     update_tx,
-                    cancel_token,
+                    intents_after_close: vec![],
                 };
                 peer_info.abort_handle = Some(abort_handle);
             }
@@ -561,18 +558,13 @@ impl PeerManager {
             Ok(ConnStep::Closed) => {
                 debug!("connection closed gracefully");
                 let peer_info = self.peers.remove(&peer).expect("just checked");
-                if let PeerState::Closing {
-                    new_intents,
-                    old_intents,
-                } = peer_info.state
-                {
-                    drop(old_intents);
-                    if !new_intents.is_empty() {
+                if let PeerState::Closing { intents } = peer_info.state {
+                    if !intents.is_empty() {
                         debug!(
                             "resubmitting {} intents that were not yet processed",
-                            new_intents.len()
+                            intents.len()
                         );
-                        for intent in new_intents {
+                        for intent in intents {
                             self.submit_intent(peer, intent).await;
                         }
                     }
@@ -584,7 +576,7 @@ impl PeerManager {
         Ok(())
     }
 
-    fn init_shutdown(&mut self) {
+    async fn init_shutdown(&mut self) {
         self.shutting_down = true;
         for peer in self.peers.values() {
             match &peer.state {
@@ -597,9 +589,12 @@ impl PeerManager {
                     }
                 }
                 PeerState::Closing { .. } => {}
-                PeerState::Active { cancel_token, .. } => {
+                PeerState::Active { update_tx, .. } => {
                     // We are in active state. We cancel our session, which leads to graceful connection termination.
-                    cancel_token.cancel();
+                    update_tx
+                        .send(SessionUpdate::Abort(Error::ShuttingDown))
+                        .await
+                        .ok();
                 }
             }
         }
@@ -648,12 +643,12 @@ enum PeerState {
         cancel_dial: Option<CancellationToken>,
     },
     Active {
-        cancel_token: CancellationToken,
         update_tx: mpsc::Sender<SessionUpdate>,
+        /// List of intents that we failed to submit into the session because it is closing.
+        intents_after_close: Vec<Intent>,
     },
     Closing {
-        old_intents: Vec<Intent>,
-        new_intents: Vec<Intent>,
+        intents: Vec<Intent>,
     },
 }
 

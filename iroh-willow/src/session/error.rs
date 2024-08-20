@@ -1,4 +1,5 @@
 use ed25519_dalek::SignatureError;
+use tokio::sync::mpsc;
 
 use crate::{
     proto::{data_model::UnauthorisedWriteError, meadowcap::UserId, wgps::ResourceHandle},
@@ -71,10 +72,16 @@ pub enum Error {
     Pai(#[from] PaiError),
     #[error("net failed: {0}")]
     Net(anyhow::Error),
-    #[error("channel receiver dropped")]
-    ChannelDropped,
+    #[error("channel closed unexpectedly")]
+    ChannelClosed,
     #[error("our node is shutting down")]
     ShuttingDown,
+    #[error("The operation was cancelled locally")]
+    Cancelled,
+    #[error("Connection was closed by peer")]
+    ConnectionClosed(#[source] anyhow::Error),
+    #[error("Session was closed by peer")]
+    SessionClosedByPeer,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -82,7 +89,7 @@ pub enum Error {
 pub struct ChannelReceiverDropped;
 impl From<ChannelReceiverDropped> for Error {
     fn from(_: ChannelReceiverDropped) -> Self {
-        Self::ChannelDropped
+        Self::ChannelClosed
     }
 }
 
@@ -133,5 +140,11 @@ impl From<SignatureError> for Error {
 impl From<MissingResource> for Error {
     fn from(value: MissingResource) -> Self {
         Self::MissingResource(value.0)
+    }
+}
+
+impl<T> From<mpsc::error::SendError<T>> for Error {
+    fn from(_error: mpsc::error::SendError<T>) -> Self {
+        Self::ChannelClosed
     }
 }
