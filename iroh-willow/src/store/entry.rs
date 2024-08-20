@@ -5,7 +5,7 @@ use std::{
 use tokio::sync::broadcast;
 
 use crate::proto::{
-    data_model::{AuthorisedEntry, NamespaceId},
+    data_model::{AuthorisedEntry, Entry, NamespaceId},
     grouping::Area,
 };
 
@@ -67,6 +67,11 @@ impl<ES: EntryStorage> WatchableEntryStore<ES> {
     /// Returns a store snapshot.
     pub fn snapshot(&self) -> anyhow::Result<ES::Snapshot> {
         self.storage.snapshot()
+    }
+
+    /// Removes the entry from the store.
+    pub fn remove(&self, entry: &Entry) -> anyhow::Result<bool> {
+        Ok(self.storage.remove_entry(entry)?)
     }
 
     /// Ingest a new entry.

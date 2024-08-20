@@ -261,6 +261,22 @@ impl traits::EntryStorage for Rc<RefCell<EntryStore>> {
         entries.push(entry.clone());
         Ok(true)
     }
+
+    fn remove_entry(&self, entry: &Entry) -> Result<bool> {
+        let mut slf = self.borrow_mut();
+
+        let entries = slf.entries.entry(*entry.namespace_id()).or_default();
+
+        let del_index =
+            entries
+                .iter()
+                .enumerate()
+                .find_map(|(i, el)| if el.entry() == entry { Some(i) } else { None });
+
+        let removed = del_index.map(|i| entries.remove(i));
+
+        Ok(removed.is_some())
+    }
 }
 
 #[derive(Debug, Default)]

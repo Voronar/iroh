@@ -114,6 +114,17 @@ impl ActorHandle {
         Ok(inserted)
     }
 
+    /// Out of protocol feature for special cases (e.g. capability revocation)
+    pub async fn remove_entries(&self, entries: Vec<Entry>) -> Result<Vec<bool>> {
+        let (reply, reply_rx) = oneshot::channel();
+
+        self.send(Input::RemoveEntries { entries, reply }).await?;
+
+        let res = reply_rx.await??;
+
+        Ok(res)
+    }
+
     pub async fn insert_secret(&self, secret: impl Into<meadowcap::SecretKey>) -> Result<()> {
         let secret = secret.into();
         let (reply, reply_rx) = oneshot::channel();
@@ -275,6 +286,10 @@ pub enum Input {
         entry: EntryOrForm,
         auth: AuthForm,
         reply: oneshot::Sender<Result<(Entry, bool), Error>>,
+    },
+    RemoveEntries {
+        entries: Vec<Entry>,
+        reply: oneshot::Sender<Result<Vec<bool>>>,
     },
     InsertSecret {
         secret: meadowcap::SecretKey,
@@ -460,6 +475,10 @@ impl<S: Storage> Actor<S> {
             }
             Input::InsertSecret { secret, reply } => {
                 let res = self.store.secrets().insert(secret);
+                send_reply(reply, res.map_err(anyhow::Error::from))
+            }
+            Input::RemoveEntries { entries, reply } => {
+                let res = self.store.remove_entries(entries);
                 send_reply(reply, res.map_err(anyhow::Error::from))
             }
             Input::CreateNamespace { kind, owner, reply } => {

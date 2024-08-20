@@ -160,4 +160,16 @@ impl<S: Storage> Store<S> {
         );
         Ok(entry)
     }
+
+    pub fn remove_entries(&self, entries: Vec<Entry>) -> Result<Vec<bool>> {
+        let mut res = vec![];
+
+        for entry in entries {
+            let is_removed = self.entries().remove(&entry)?;
+
+            res.push(is_removed);
+        }
+
+        Ok(res)
+    }
 }
