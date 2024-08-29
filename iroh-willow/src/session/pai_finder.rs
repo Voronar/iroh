@@ -2,13 +2,14 @@
 //!
 //! As defined by the willow spec: [Private Area Intersection](https://willowprotocol.org/specs/pai/index.html)
 //!
-//! Partly ported from the implementation in earthstar and willow:
-//!
-//! * https://github.com/earthstar-project/willow-js/blob/0db4b9ec7710fb992ab75a17bd8557040d9a1062/src/wgps/pai/pai_finder.ts
-//! * https://github.com/earthstar-project/earthstar/blob/16d6d4028c22fdbb72f7395013b29be7dcd9217a/src/schemes/schemes.ts#L662
+//! Partly ported from the implementation in [earthstar] and [willow].
 //!
 //! Licensed under LGPL and ported into this MIT/Apache codebase with explicit permission
 //! from the original author (gwil).
+//!
+//! [earthstar]: https://github.com/earthstar-project/willow-js/blob/0db4b9ec7710fb992ab75a17bd8557040d9a1062/src/wgps/pai/pai_finder.ts
+//! [willow]: https://github.com/earthstar-project/earthstar/blob/16d6d4028c22fdbb72f7395013b29be7dcd9217a/src/schemes/schemes.ts#L662
+//!
 
 use std::collections::{HashMap, HashSet};
 
@@ -503,6 +504,8 @@ mod tests {
     use futures_util::SinkExt;
     use rand_core::{CryptoRngCore, SeedableRng};
     use tokio::task::{spawn_local, JoinHandle, LocalSet};
+    use tokio_stream::wrappers::ReceiverStream;
+    use tokio_util::sync::PollSender;
     use tracing::{error_span, Instrument, Span};
 
     use crate::{
@@ -536,15 +539,15 @@ mod tests {
         let auth_alfie = ReadAuthorisation::new_owned(&namespace_secret, alfie_public).unwrap();
         let auth_betty = ReadAuthorisation::new_owned(&namespace_secret, betty_public).unwrap();
 
-        let (alfie, betty) = Handle::create_two();
+        let (mut alfie, mut betty) = Handle::create_two();
 
         alfie.submit(auth_alfie.clone()).await;
         betty.submit(auth_betty.clone()).await;
 
-        transfer::<PaiBindFragment>(&alfie, &betty).await;
-        transfer::<PaiBindFragment>(&betty, &alfie).await;
-        transfer::<PaiReplyFragment>(&alfie, &betty).await;
-        transfer::<PaiReplyFragment>(&betty, &alfie).await;
+        transfer::<PaiBindFragment>(&mut alfie, &betty).await;
+        transfer::<PaiBindFragment>(&mut betty, &alfie).await;
+        transfer::<PaiReplyFragment>(&mut alfie, &betty).await;
+        transfer::<PaiReplyFragment>(&mut betty, &alfie).await;
 
         assert_eq!(alfie.next_intersection().await.authorisation, auth_alfie);
         assert_eq!(betty.next_intersection().await.authorisation, auth_betty);
@@ -589,22 +592,22 @@ mod tests {
             .unwrap();
         assert!(betty_auth.subspace_cap().is_some());
 
-        let (alfie, betty) = Handle::create_two();
+        let (mut alfie, mut betty) = Handle::create_two();
 
         alfie.submit(alfie_auth.clone()).await;
         betty.submit(betty_auth.clone()).await;
 
-        transfer::<PaiBindFragment>(&alfie, &betty).await;
-        transfer::<PaiBindFragment>(&betty, &alfie).await;
+        transfer::<PaiBindFragment>(&mut alfie, &betty).await;
+        transfer::<PaiBindFragment>(&mut betty, &alfie).await;
 
-        transfer::<PaiBindFragment>(&alfie, &betty).await;
-        transfer::<PaiBindFragment>(&betty, &alfie).await;
+        transfer::<PaiBindFragment>(&mut alfie, &betty).await;
+        transfer::<PaiBindFragment>(&mut betty, &alfie).await;
 
-        transfer::<PaiReplyFragment>(&alfie, &betty).await;
-        transfer::<PaiReplyFragment>(&betty, &alfie).await;
+        transfer::<PaiReplyFragment>(&mut alfie, &betty).await;
+        transfer::<PaiReplyFragment>(&mut betty, &alfie).await;
 
-        transfer::<PaiReplyFragment>(&alfie, &betty).await;
-        transfer::<PaiReplyFragment>(&betty, &alfie).await;
+        transfer::<PaiReplyFragment>(&mut alfie, &betty).await;
+        transfer::<PaiReplyFragment>(&mut betty, &alfie).await;
 
         let next: PaiRequestSubspaceCapability = alfie.next_message().await;
         betty
@@ -641,7 +644,10 @@ mod tests {
         (secret, public.id())
     }
 
-    async fn transfer<T: TryFrom<Message> + Into<IntersectionMessage>>(from: &Handle, to: &Handle) {
+    async fn transfer<T: TryFrom<Message> + Into<IntersectionMessage>>(
+        from: &mut Handle,
+        to: &Handle,
+    ) {
         let message = from.next_message::<T>().await;
         let message: IntersectionMessage = message.into();
         to.receive(message).await;
@@ -649,9 +655,10 @@ mod tests {
 
     struct Handle {
         task: JoinHandle<Result<(), Error>>,
-        input: flume::Sender<Input>,
-        output: flume::Receiver<Output>,
+        input: tokio::sync::mpsc::Sender<Input>,
+        output: tokio::sync::mpsc::Receiver<Output>,
     }
+
     impl Handle {
         pub fn create_two() -> (Self, Self) {
             (
@@ -661,13 +668,12 @@ mod tests {
         }
 
         pub fn new(span: Span) -> Self {
-            let (input, input_rx) = flume::bounded(1);
-            let (output_tx, output) = flume::bounded(1);
+            let (input, input_rx) = tokio::sync::mpsc::channel(1);
+            let (output_tx, output) = tokio::sync::mpsc::channel(1);
             input.try_send(Input::Established).expect("has capacity");
-            let outbox = output_tx
-                .into_sink()
-                .sink_map_err(|_| Error::InvalidState("failed to send"));
-            let inbox = input_rx.into_stream();
+            let outbox =
+                PollSender::new(output_tx).sink_map_err(|_| Error::InvalidState("failed to send"));
+            let inbox = ReceiverStream::new(input_rx);
             let task = spawn_local(
                 async move { PaiFinder::run_with_sink(inbox, outbox).await }.instrument(span),
             );
@@ -679,7 +685,7 @@ mod tests {
         }
 
         pub async fn input(&self, input: Input) {
-            self.input.send_async(input).await.unwrap();
+            self.input.send(input).await.unwrap();
         }
 
         pub async fn submit(&self, auth: ReadAuthorisation) {
@@ -690,18 +696,18 @@ mod tests {
             self.input(Input::ReceivedMessage(Ok(message.into()))).await
         }
 
-        pub async fn next(&self) -> Output {
-            self.output.recv_async().await.unwrap()
+        pub async fn next(&mut self) -> Output {
+            self.output.recv().await.unwrap()
         }
 
-        pub async fn next_intersection(&self) -> PaiIntersection {
+        pub async fn next_intersection(&mut self) -> PaiIntersection {
             match self.next().await {
                 Output::NewIntersection(intersection) => intersection,
                 out => panic!("expected NewIntersection but got {out:?}"),
             }
         }
 
-        pub async fn next_message<T: TryFrom<Message>>(&self) -> T {
+        pub async fn next_message<T: TryFrom<Message>>(&mut self) -> T {
             match self.next().await {
                 Output::SendMessage(message) => {
                     let dbg = format!("{}", message);

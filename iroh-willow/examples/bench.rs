@@ -86,6 +86,8 @@ async fn main() -> Result<()> {
     info!("betty has now {} entries", betty_count);
     assert_eq!(alfie_count, n_alfie + n_betty);
     assert_eq!(betty_count, n_alfie + n_betty);
+    alfie.shutdown().await?;
+    betty.shutdown().await?;
 
     Ok(())
 }
@@ -144,14 +146,17 @@ mod util {
                 let engine = engine.clone();
                 let endpoint = endpoint.clone();
                 async move {
-                    while let Some(mut conn) = endpoint.accept().await {
-                        let Ok(alpn) = conn.alpn().await else {
+                    while let Some(incoming) = endpoint.accept().await {
+                        let Ok(mut connecting) = incoming.accept() else {
+                            continue;
+                        };
+                        let Ok(alpn) = connecting.alpn().await else {
                             continue;
                         };
                         if alpn != ALPN {
                             continue;
                         }
-                        let Ok(conn) = conn.await else {
+                        let Ok(conn) = connecting.await else {
                             continue;
                         };
                         engine.handle_connection(conn).await?;
@@ -227,7 +232,7 @@ mod util {
 
         let cap_for_betty = alfie
             .delegate_caps(
-                CapSelector::widest(namespace_id),
+                CapSelector::any(namespace_id),
                 AccessMode::Write,
                 DelegateTo::new(user_betty, RestrictArea::None),
             )

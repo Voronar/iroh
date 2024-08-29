@@ -332,14 +332,17 @@ mod util {
                 let engine = engine.clone();
                 let endpoint = endpoint.clone();
                 async move {
-                    while let Some(mut conn) = endpoint.accept().await {
-                        let Ok(alpn) = conn.alpn().await else {
+                    while let Some(incoming) = endpoint.accept().await {
+                        let Ok(mut connecting) = incoming.accept() else {
+                            continue;
+                        };
+                        let Ok(alpn) = connecting.alpn().await else {
                             continue;
                         };
                         if alpn != ALPN {
                             continue;
                         }
-                        let Ok(conn) = conn.await else {
+                        let Ok(conn) = connecting.await else {
                             continue;
                         };
                         engine.handle_connection(conn).await?;
@@ -416,7 +419,7 @@ mod util {
 
         let cap_for_betty = alfie
             .delegate_caps(
-                CapSelector::widest(namespace_id),
+                CapSelector::any(namespace_id),
                 AccessMode::Write,
                 DelegateTo::new(user_betty, RestrictArea::None),
             )
@@ -435,7 +438,7 @@ mod util {
     ) -> Result<()> {
         let path = Path::from_bytes(path)?;
         let entry = EntryForm::new_bytes(namespace_id, path, bytes);
-        handle.insert(entry, user).await?;
+        handle.insert_entry(entry, user).await?;
         Ok(())
     }
 }
@@ -508,7 +511,7 @@ async fn peer_manager_big_payload() -> Result<()> {
     let entries: Vec<_> = entries.try_collect().await?;
     assert_eq!(entries.len(), 1);
     let entry = &entries[0];
-    let hash: iroh_blobs::Hash = (*entry.payload_digest()).into();
+    let hash: iroh_blobs::Hash = (*entry.entry().payload_digest()).into();
     let blob = alfie.blobs.get(&hash).await?.expect("missing blob");
     let actual = blob.data_reader().await?.read_to_end().await?;
     assert_eq!(actual.len(), payload.len());

@@ -74,6 +74,11 @@ impl<ES: EntryStorage> WatchableEntryStore<ES> {
         Ok(self.storage.remove_entry(entry)?)
     }
 
+    /// Returns a store reader.
+    pub fn reader(&self) -> ES::Reader {
+        self.storage.reader()
+    }
+
     /// Ingest a new entry.
     ///
     /// Returns `true` if the entry was stored, and `false` if the entry already exists or is

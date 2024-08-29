@@ -54,8 +54,6 @@ const ENDPOINT_WAIT: Duration = Duration::from_secs(5);
 /// Default interval between GC runs.
 const DEFAULT_GC_INTERVAL: Duration = Duration::from_secs(60 * 5);
 
-const MAX_CONNECTIONS: u32 = 1024;
-
 /// Storage backend for documents.
 #[derive(Debug, Clone)]
 pub enum DocsStorage {
@@ -64,6 +62,18 @@ pub enum DocsStorage {
     /// In-memory storage.
     Memory,
     /// File-based persistent storage.
+    Persistent(PathBuf),
+}
+
+/// Storage backend for spaces.
+#[derive(Debug, Clone)]
+pub enum SpacesStorage {
+    /// Disable docs completely.
+    Disabled,
+    /// In-memory storage.
+    Memory,
+    /// File-based persistent storage.
+    #[allow(unused)]
     Persistent(PathBuf),
 }
 
@@ -108,6 +118,7 @@ where
     dns_resolver: Option<DnsResolver>,
     node_discovery: DiscoveryConfig,
     docs_storage: DocsStorage,
+    spaces_storage: SpacesStorage,
     #[cfg(any(test, feature = "test-utils"))]
     insecure_skip_relay_cert_verify: bool,
     /// Callback to register when a gc loop is done
@@ -235,6 +246,7 @@ impl Default for Builder<iroh_blobs::store::mem::Store> {
             rpc_addr: None,
             gc_policy: GcPolicy::Disabled,
             docs_storage: DocsStorage::Memory,
+            spaces_storage: SpacesStorage::Memory,
             node_discovery: Default::default(),
             #[cfg(any(test, feature = "test-utils"))]
             insecure_skip_relay_cert_verify: false,
@@ -269,6 +281,8 @@ impl<D: Map> Builder<D> {
             rpc_addr: None,
             gc_policy: GcPolicy::Disabled,
             docs_storage,
+            // TODO: Expose in function
+            spaces_storage: SpacesStorage::Disabled,
             node_discovery: Default::default(),
             #[cfg(any(test, feature = "test-utils"))]
             insecure_skip_relay_cert_verify: false,
@@ -322,6 +336,8 @@ where
             dns_resolver: self.dns_resolver,
             gc_policy: self.gc_policy,
             docs_storage,
+            // TODO: Switch to SpacesStorage::Persistent once we have a store.
+            spaces_storage: SpacesStorage::Disabled,
             node_discovery: self.node_discovery,
             #[cfg(any(test, feature = "test-utils"))]
             insecure_skip_relay_cert_verify: false,
@@ -373,6 +389,12 @@ where
     /// Disables documents support on this node completely.
     pub fn disable_docs(mut self) -> Self {
         self.docs_storage = DocsStorage::Disabled;
+        self
+    }
+
+    /// Disables spaces support on this node completely.
+    pub fn disable_spaces(mut self) -> Self {
+        self.spaces_storage = SpacesStorage::Disabled;
         self
     }
 
@@ -535,7 +557,6 @@ where
                 .secret_key(self.secret_key.clone())
                 .proxy_from_env()
                 .keylog(self.keylog)
-                .concurrent_connections(MAX_CONNECTIONS)
                 .relay_mode(self.relay_mode);
             let endpoint = match discovery {
                 Some(discovery) => endpoint.discovery(discovery),
@@ -588,6 +609,25 @@ where
         )
         .await?;
 
+        let willow = match self.spaces_storage {
+            SpacesStorage::Disabled => None,
+            SpacesStorage::Memory => {
+                let blobs_store = self.blobs_store.clone();
+                let create_store = move || iroh_willow::store::memory::Store::new(blobs_store);
+                let engine = iroh_willow::Engine::spawn(
+                    endpoint.clone(),
+                    create_store,
+                    iroh_willow::engine::AcceptOpts::default(),
+                );
+                Some(engine)
+            }
+            SpacesStorage::Persistent(_) => {
+                unimplemented!("peristent storage for willow is not yet implemented")
+            }
+        };
+        // Spawn the willow engine.
+        // TODO: Allow to disable.
+
         // Initialize the internal RPC connection.
         let (internal_rpc, controller) = quic_rpc::transport::flume::connection::<RpcService>(32);
         let internal_rpc = quic_rpc::transport::boxed::ServerEndpoint::new(internal_rpc);
@@ -608,6 +648,7 @@ where
             gossip,
             local_pool_handle: lp.handle().clone(),
             blob_batches: Default::default(),
+            willow,
         });
 
         let protocol_builder = ProtocolBuilder {
@@ -762,6 +803,10 @@ impl<D: iroh_blobs::store::Store> ProtocolBuilder<D> {
             self = self.accept(DOCS_ALPN, Arc::new(docs));
         }
 
+        if let Some(engine) = self.inner.willow.clone() {
+            self = self.accept(iroh_willow::ALPN, Arc::new(engine));
+        }
+
         self
     }
 
@@ -851,14 +896,15 @@ impl Default for GcPolicy {
 }
 
 const DEFAULT_RPC_PORT: u16 = 0x1337;
-const MAX_RPC_CONNECTIONS: u32 = 16;
 const MAX_RPC_STREAMS: u32 = 1024;
 
 /// The default bind addr of the RPC .
 pub const DEFAULT_RPC_ADDR: SocketAddr =
     SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, DEFAULT_RPC_PORT));
 
-/// Makes a an RPC endpoint that uses a QUIC transport
+/// Makes a an RPC endpoint that uses a QUIC transport.
+///
+/// Note that this uses the Quinn version used by quic-rpc.
 fn make_rpc_endpoint(
     secret_key: &SecretKey,
     mut rpc_addr: SocketAddr,
@@ -867,13 +913,12 @@ fn make_rpc_endpoint(
     transport_config
         .max_concurrent_bidi_streams(MAX_RPC_STREAMS.into())
         .max_concurrent_uni_streams(0u32.into());
-    let mut server_config = iroh_net::endpoint::make_server_config(
+    let server_config = iroh_net::endpoint::make_server_config(
         secret_key,
         vec![RPC_ALPN.to_vec()],
         Arc::new(transport_config),
         false,
     )?;
-    server_config.concurrent_connections(MAX_RPC_CONNECTIONS);
 
     let rpc_quinn_endpoint = quinn::Endpoint::server(server_config.clone(), rpc_addr);
     let rpc_quinn_endpoint = match rpc_quinn_endpoint {
