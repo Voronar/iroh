@@ -3,12 +3,16 @@
 use std::fmt::Debug;
 
 use anyhow::Result;
+use futures_lite::Stream;
+use serde::{Deserialize, Serialize};
 
 use crate::{
     interest::{CapSelector, CapabilityPack},
     proto::{
-        data_model::{AuthorisedEntry, Entry, NamespaceId, Path, SubspaceId, WriteCapability},
-        grouping::Range3d,
+        data_model::{
+            self, AuthorisedEntry, Entry, NamespaceId, Path, SubspaceId, WriteCapability,
+        },
+        grouping::{Area, Range3d},
         keys::{NamespaceSecretKey, NamespaceSignature, UserId, UserSecretKey, UserSignature},
         meadowcap::{self, McCapability, ReadAuthorisation},
         wgps::Fingerprint,
@@ -84,10 +88,36 @@ pub trait EntryStorage: EntryReader + Clone + Debug + 'static {
 
     fn reader(&self) -> Self::Reader;
     fn snapshot(&self) -> Result<Self::Snapshot>;
-    fn ingest_entry(&self, entry: &AuthorisedEntry) -> Result<bool>;
 
     /// Out of protocol feature for special cases (e.g. capability revocation)
     fn remove_entry(&self, entry: &Entry) -> Result<bool>;
+
+    /// Ingest a new entry.
+    ///
+    /// Returns `true` if the entry was ingested, and `false` if the entry was not ingested because a newer entry exists.
+    fn ingest_entry(&self, entry: &AuthorisedEntry, origin: EntryOrigin) -> Result<bool>;
+
+    /// Subscribe to events concerning entries [included](https://willowprotocol.org/specs/grouping-entries/index.html#area_include)
+    /// by an [`AreaOfInterest`], returning a producer of `StoreEvent`s which occurred since the moment of calling this function.
+    ///
+    /// If `ignore_incomplete_payloads` is `true`, the producer will not produce entries with incomplete corresponding payloads.
+    /// If `ignore_empty_payloads` is `true`, the producer will not produce entries with a `payload_length` of `0`.
+    fn subscribe_area(
+        &self,
+        namespace: NamespaceId,
+        area: Area,
+        params: SubscribeParams,
+    ) -> impl Stream<Item = StoreEvent> + Unpin + 'static;
+
+    /// Attempt to resume a subscription using a *progress ID* obtained from a previous subscription, or return an error
+    /// if this store implementation is unable to resume the subscription.
+    fn resume_subscription(
+        &self,
+        progress_id: u64,
+        namespace: NamespaceId,
+        area: Area,
+        params: SubscribeParams,
+    ) -> impl Stream<Item = StoreEvent> + Unpin + 'static;
 }
 
 /// Read-only interface to [`EntryStorage`].
@@ -184,4 +214,131 @@ pub trait CapsStorage: Debug + Clone {
     fn del_caps(&self, selector: &CapSelector) -> Result<Vec<McCapability>>;
 
     fn get_read_cap(&self, selector: &CapSelector) -> Result<Option<ReadAuthorisation>>;
+}
+
+/// An event which took place within a [`EntryStorage`].
+/// Each event includes a *progress ID* which can be used to *resume* a subscription at any point in the future.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum StoreEvent {
+    /// A new entry was ingested.
+    Ingested(
+        u64,
+        #[serde(with = "data_model::serde_encoding::authorised_entry")] AuthorisedEntry,
+        EntryOrigin,
+    ),
+    // PayloadForgotten(u64, PD),
+    /// An entry was pruned via prefix pruning.
+    Pruned(u64, PruneEvent),
+    // /// An existing entry received a portion of its corresponding payload.
+    // Appended(u64, LengthyAuthorisedEntry),
+    // /// An entry was forgotten.
+    // EntryForgotten(u64, (S, Path<MCL, MCC, MPL>)),
+    // /// A payload was forgotten.
+}
+
+impl StoreEvent {
+    pub fn progress_id(&self) -> u64 {
+        match self {
+            StoreEvent::Ingested(id, _, _) => *id,
+            StoreEvent::Pruned(id, _) => *id,
+        }
+    }
+}
+
+impl StoreEvent {
+    /// Returns `true` if the event is included in the `area` and not skipped by `ignore_params`.
+    pub fn matches(
+        &self,
+        namespace_id: NamespaceId,
+        area: &Area,
+        params: &SubscribeParams,
+    ) -> bool {
+        match self {
+            StoreEvent::Ingested(_, entry, origin) => {
+                *entry.entry().namespace_id() == namespace_id
+                    && area.includes_entry(entry.entry())
+                    && params.includes_entry(entry.entry())
+                    && params.includes_origin(origin)
+            }
+            StoreEvent::Pruned(_, PruneEvent { pruned, by: _ }) => {
+                !params.ingest_only
+                    && *pruned.entry().namespace_id() == namespace_id
+                    && area.includes_entry(pruned.entry())
+            }
+        }
+    }
+}
+
+/// Describes an [`AuthorisedEntry`] which was pruned and the [`AuthorisedEntry`] which triggered the pruning.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PruneEvent {
+    #[serde(with = "data_model::serde_encoding::authorised_entry")]
+    pub pruned: AuthorisedEntry,
+    /// The entry which triggered the pruning.
+    #[serde(with = "data_model::serde_encoding::authorised_entry")]
+    pub by: AuthorisedEntry,
+}
+
+/// The origin of an entry ingestion event.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+pub enum EntryOrigin {
+    /// The entry was probably created on this machine.
+    Local,
+    /// The entry was sourced from another device, e.g. a networked sync session.
+    Remote(u64),
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum EntryChannel {
+    Reconciliation,
+    Data,
+}
+
+/// Describes which entries to ignore during a query.
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct SubscribeParams {
+    /// Omit entries whose payload is the empty string.
+    pub ignore_empty_payloads: bool,
+    /// Omit entries whose origin is this remote.
+    pub ignore_remote: Option<u64>,
+    /// Only emit ingestion events.
+    pub ingest_only: bool,
+    // TODO: ignore_incomplete_payloads is harder to support for us because we need to query the blob store each time currently.
+    // /// Omit entries with locally incomplete corresponding payloads.
+    // pub ignore_incomplete_payloads: bool,
+}
+
+impl SubscribeParams {
+    // pub fn ignore_incomplete_payloads(&mut self) {
+    //     self.ignore_incomplete_payloads = true;
+    // }
+
+    pub fn ignore_empty_payloads(mut self) -> Self {
+        self.ignore_empty_payloads = true;
+        self
+    }
+
+    pub fn ignore_remote(mut self, remote: u64) -> Self {
+        self.ignore_remote = Some(remote);
+        self
+    }
+
+    pub fn ingest_only(mut self) -> Self {
+        self.ingest_only = true;
+        self
+    }
+
+    pub fn includes_entry(&self, entry: &Entry) -> bool {
+        !(self.ignore_empty_payloads && entry.payload_length() == 0)
+    }
+
+    pub fn includes_origin(&self, origin: &EntryOrigin) -> bool {
+        match &self.ignore_remote {
+            None => true,
+            Some(ignored_session) => match origin {
+                EntryOrigin::Local => true,
+                EntryOrigin::Remote(session) => session != ignored_session,
+            },
+        }
+    }
 }

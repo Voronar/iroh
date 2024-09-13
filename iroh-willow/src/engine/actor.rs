@@ -2,7 +2,7 @@ use std::{sync::Arc, thread::JoinHandle};
 
 use anyhow::Result;
 use bytes::Bytes;
-use futures_lite::stream::Stream;
+use futures_lite::{stream::Stream, StreamExt};
 use iroh_base::key::NodeId;
 use tokio::{
     sync::{mpsc, oneshot},
@@ -17,14 +17,16 @@ use crate::{
     net::ConnHandle,
     proto::{
         data_model::{AuthorisedEntry, Entry, Path, SubspaceId},
-        grouping::Range3d,
+        grouping::{Area, Range3d},
         keys::{NamespaceId, NamespaceKind, UserId, UserSecretKey},
         meadowcap::{self, AccessMode, McCapability, ReadAuthorisation},
     },
     session::{intents::Intent, run_session, Error, EventSender, SessionHandle},
     store::{
-        entry::EntryOrigin,
-        traits::{EntryReader, SecretStorage, Storage},
+        traits::{
+            EntryOrigin, EntryReader, EntryStorage, SecretStorage, Storage, StoreEvent,
+            SubscribeParams,
+        },
         Store,
     },
 };
@@ -254,6 +256,42 @@ impl ActorHandle {
         reply_rx.await?;
         Ok(())
     }
+
+    pub async fn subscribe_area(
+        &self,
+        namespace: NamespaceId,
+        area: Area,
+        params: SubscribeParams,
+        sender: mpsc::Sender<StoreEvent>,
+    ) -> Result<()> {
+        self.send(Input::SubscribeArea {
+            namespace,
+            area,
+            params,
+            sender,
+        })
+        .await?;
+        Ok(())
+    }
+
+    pub async fn resume_subscription(
+        &self,
+        progress_id: u64,
+        namespace: NamespaceId,
+        area: Area,
+        params: SubscribeParams,
+        sender: mpsc::Sender<StoreEvent>,
+    ) -> Result<()> {
+        self.send(Input::ResumeSubscription {
+            progress_id,
+            namespace,
+            area,
+            params,
+            sender,
+        })
+        .await?;
+        Ok(())
+    }
 }
 
 impl Drop for ActorHandle {
@@ -369,6 +407,19 @@ pub enum Input {
     Shutdown {
         #[debug(skip)]
         reply: Option<oneshot::Sender<()>>,
+    },
+    SubscribeArea {
+        namespace: NamespaceId,
+        area: Area,
+        params: SubscribeParams,
+        sender: mpsc::Sender<StoreEvent>,
+    },
+    ResumeSubscription {
+        progress_id: u64,
+        namespace: NamespaceId,
+        area: Area,
+        params: SubscribeParams,
+        sender: mpsc::Sender<StoreEvent>,
     },
 }
 
@@ -506,7 +557,7 @@ impl<S: Storage> Actor<S> {
                 origin,
                 reply,
             } => {
-                let res = self.store.entries().ingest(&authorised_entry, origin);
+                let res = self.store.entries().ingest_entry(&authorised_entry, origin);
                 send_reply(reply, res)
             }
             Input::InsertEntry { entry, auth, reply } => {
@@ -578,6 +629,46 @@ impl<S: Storage> Actor<S> {
             Input::ResolveInterests { interests, reply } => {
                 let res = self.store.auth().resolve_interests(interests);
                 send_reply(reply, res.map_err(anyhow::Error::from))
+            }
+            Input::SubscribeArea {
+                namespace,
+                area,
+                params,
+                sender,
+            } => {
+                let store = self.store.clone();
+                self.tasks.spawn_local(async move {
+                    // TODO: We wouldn't need to manually forward in a loop here if subscribe_area took a sender
+                    // instead of returning a stream.
+                    let mut stream = store.entries().subscribe_area(namespace, area, params);
+                    while let Some(event) = stream.next().await {
+                        if sender.send(event).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+                Ok(())
+            }
+            Input::ResumeSubscription {
+                progress_id,
+                namespace,
+                area,
+                params,
+                sender,
+            } => {
+                let store = self.store.clone();
+                self.tasks.spawn_local(async move {
+                    let mut stream =
+                        store
+                            .entries()
+                            .resume_subscription(progress_id, namespace, area, params);
+                    while let Some(event) = stream.next().await {
+                        if sender.send(event).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+                Ok(())
             }
         }
     }

@@ -10,7 +10,8 @@ use iroh_willow::{
         keys::NamespaceKind,
         meadowcap::AccessMode,
     },
-    session::intents::Completion,
+    session::{intents::Completion, SessionMode},
+    store::traits::{EntryOrigin, StoreEvent},
 };
 use tracing::info;
 
@@ -75,7 +76,10 @@ async fn spaces_smoke() -> Result<()> {
         .await?;
 
     println!("ticket {ticket:?}");
-    let (betty_space, betty_sync_intent) = betty.spaces().import_and_sync(ticket).await?;
+    let (betty_space, betty_sync_intent) = betty
+        .spaces()
+        .import_and_sync(ticket, SessionMode::ReconcileOnce)
+        .await?;
 
     let mut completion = betty_sync_intent.complete_all().await;
     assert_eq!(completion.len(), 1);
@@ -130,5 +134,122 @@ async fn spaces_smoke() -> Result<()> {
         .await?;
     assert_eq!(alfie_entries.len(), 3);
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn spaces_subscription() -> Result<()> {
+    iroh_test::logging::setup_multithreaded();
+    let (alfie_addr, alfie) = spawn_node().await;
+    let (betty_addr, betty) = spawn_node().await;
+    info!("alfie is {}", alfie_addr.node_id.fmt_short());
+    info!("betty is {}", betty_addr.node_id.fmt_short());
+
+    let betty_user = betty.spaces().create_user().await?;
+    let alfie_user = alfie.spaces().create_user().await?;
+    let alfie_space = alfie
+        .spaces()
+        .create(NamespaceKind::Owned, alfie_user)
+        .await?;
+
+    let _namespace = alfie_space.namespace_id();
+
+    let mut alfie_sub = alfie_space
+        .subscribe_area(Area::new_full(), Default::default())
+        .await?;
+
+    let ticket = alfie_space
+        .share(betty_user, AccessMode::Write, RestrictArea::None)
+        .await?;
+
+    let (betty_space, betty_sync_intent) = betty
+        .spaces()
+        .import_and_sync(ticket, SessionMode::Continuous)
+        .await?;
+
+    let _sync_task = tokio::task::spawn(async move {
+        // TODO: We should add a "detach" method to a sync intent!
+        // (leaves the sync running but stop consuming events)
+        let _ = betty_sync_intent.complete_all().await;
+    });
+
+    let mut betty_sub = betty_space
+        .resume_subscription(0, Area::new_full(), Default::default())
+        .await?;
+
+    betty_space
+        .insert_bytes(
+            EntryForm::new(betty_user, Path::from_bytes(&[b"foo"])?),
+            "hi",
+        )
+        .await?;
+
+    let ev = betty_sub.next().await.unwrap().unwrap();
+    println!("BETTY 1 {ev:?}");
+    assert!(matches!(ev, StoreEvent::Ingested(0, _, EntryOrigin::Local)));
+
+    let ev = alfie_sub.next().await.unwrap().unwrap();
+    println!("ALFIE 1 {ev:?}");
+    assert!(matches!(
+        ev,
+        StoreEvent::Ingested(0, _, EntryOrigin::Remote(_))
+    ));
+
+    alfie_space
+        .insert_bytes(
+            EntryForm::new(alfie_user, Path::from_bytes(&[b"bar"])?),
+            "hi!!",
+        )
+        .await?;
+
+    let ev = alfie_sub.next().await.unwrap().unwrap();
+    println!("ALFIE 2 {ev:?}");
+    assert!(matches!(ev, StoreEvent::Ingested(1, _, EntryOrigin::Local)));
+
+    let ev = betty_sub.next().await.unwrap().unwrap();
+    println!("BETTY 2 {ev:?}");
+    assert!(matches!(
+        ev,
+        StoreEvent::Ingested(1, _, EntryOrigin::Remote(_))
+    ));
+
+    // let resume_sub = alfie_space
+    //     .resume_subscription(0, Area::new_full(), Default::default())
+    //     .await?;
+    // assert_eq!(resume_sub.count().await, 2);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_restricted_area() -> testresult::TestResult {
+    iroh_test::logging::setup_multithreaded();
+    const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+    let (alfie_addr, alfie) = spawn_node().await;
+    let (betty_addr, betty) = spawn_node().await;
+    info!("alfie is {}", alfie_addr.node_id.fmt_short());
+    info!("betty is {}", betty_addr.node_id.fmt_short());
+    let alfie_user = alfie.spaces().create_user().await?;
+    let betty_user = betty.spaces().create_user().await?;
+    let alfie_space = alfie
+        .spaces()
+        .create(NamespaceKind::Owned, alfie_user)
+        .await?;
+    let space_ticket = alfie_space
+        .share(
+            betty_user,
+            AccessMode::Write,
+            RestrictArea::Restrict(Area::new_subspace(betty_user)),
+        )
+        .await?;
+    let (betty_space, syncs) = betty
+        .spaces()
+        .import_and_sync(space_ticket, SessionMode::ReconcileOnce)
+        .await?;
+    let completion = tokio::time::timeout(TIMEOUT, syncs.complete_all()).await?;
+    println!("Completed syncs: {completion:#?}");
+    let stream = betty_space.get_many(Range3d::new_full()).await?;
+    let entries: Vec<_> = stream.try_collect().await?;
+    println!("{entries:#?}");
     Ok(())
 }

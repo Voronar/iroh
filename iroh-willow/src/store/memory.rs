@@ -6,11 +6,15 @@
 //! hopefully easily kept correct.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
-use std::rc::Rc;
+use std::collections::{HashMap, VecDeque};
+use std::pin::Pin;
+use std::rc::{Rc, Weak};
+use std::task::{ready, Context, Poll, Waker};
 
 use anyhow::Result;
+use futures_util::Stream;
 
+use crate::proto::grouping::Area;
 use crate::{
     interest::{CapSelector, CapabilityPack},
     proto::{
@@ -22,6 +26,9 @@ use crate::{
     },
     store::traits::{self, RangeSplit, SplitAction, SplitOpts},
 };
+
+use super::traits::{StoreEvent, SubscribeParams};
+use super::EntryOrigin;
 
 #[derive(Debug, Clone, Default)]
 pub struct Store<PS> {
@@ -109,7 +116,13 @@ impl traits::SecretStorage for Rc<RefCell<SecretStore>> {
 
 #[derive(Debug, Default)]
 pub struct EntryStore {
-    entries: HashMap<NamespaceId, Vec<AuthorisedEntry>>,
+    stores: HashMap<NamespaceId, NamespaceStore>,
+}
+
+#[derive(Debug, Default)]
+pub struct NamespaceStore {
+    entries: Vec<AuthorisedEntry>,
+    events: EventQueue<StoreEvent>,
 }
 
 // impl<T: std::ops::Deref<Target = MemoryEntryStore> + 'static> ReadonlyStore for T {
@@ -204,8 +217,9 @@ impl traits::EntryReader for Rc<RefCell<EntryStore>> {
         range: &Range3d,
     ) -> impl Iterator<Item = Result<AuthorisedEntry>> + 'a {
         let slf = self.borrow();
-        slf.entries
+        slf.stores
             .get(&namespace)
+            .map(|s| &s.entries)
             .into_iter()
             .flatten()
             .filter(|entry| range.includes_entry(entry.entry()))
@@ -221,10 +235,11 @@ impl traits::EntryReader for Rc<RefCell<EntryStore>> {
         path: &Path,
     ) -> Result<Option<AuthorisedEntry>> {
         let inner = self.borrow();
-        let Some(entries) = inner.entries.get(&namespace) else {
+        let Some(entries) = inner.stores.get(&namespace) else {
             return Ok(None);
         };
         Ok(entries
+            .entries
             .iter()
             .find(|e| {
                 let e = e.entry();
@@ -234,27 +249,15 @@ impl traits::EntryReader for Rc<RefCell<EntryStore>> {
     }
 }
 
-impl traits::EntryStorage for Rc<RefCell<EntryStore>> {
-    type Snapshot = Self;
-    type Reader = Self;
-
-    fn reader(&self) -> Self::Reader {
-        self.clone()
-    }
-
-    fn snapshot(&self) -> Result<Self::Snapshot> {
-        let entries = self.borrow().entries.clone();
-        Ok(Rc::new(RefCell::new(EntryStore { entries })))
-    }
-
-    fn ingest_entry(&self, entry: &AuthorisedEntry) -> Result<bool> {
-        let mut slf = self.borrow_mut();
-        let entries = slf
-            .entries
+impl EntryStore {
+    fn ingest_entry(&mut self, entry: &AuthorisedEntry, origin: EntryOrigin) -> Result<bool> {
+        let store = self
+            .stores
             .entry(*entry.entry().namespace_id())
             .or_default();
+        let entries = &mut store.entries;
         let new = entry.entry();
-        let mut to_remove = vec![];
+        let mut to_prune = vec![];
         for (i, existing) in entries.iter().enumerate() {
             let existing = existing.entry();
             if existing == new {
@@ -271,20 +274,31 @@ impl traits::EntryStorage for Rc<RefCell<EntryStore>> {
                 && new.path().is_prefix_of(existing.path())
                 && new.is_newer_than(existing)
             {
-                to_remove.push(i);
+                to_prune.push(i);
             }
         }
-        for i in to_remove {
-            entries.remove(i);
+        for i in to_prune {
+            let pruned = entries.remove(i);
+            store.events.insert(move |id| {
+                StoreEvent::Pruned(
+                    id,
+                    traits::PruneEvent {
+                        pruned,
+                        by: entry.clone(),
+                    },
+                )
+            });
         }
         entries.push(entry.clone());
+        store
+            .events
+            .insert(|id| StoreEvent::Ingested(id, entry.clone(), origin));
         Ok(true)
     }
 
-    fn remove_entry(&self, entry: &Entry) -> Result<bool> {
-        let mut slf = self.borrow_mut();
-
-        let entries = slf.entries.entry(*entry.namespace_id()).or_default();
+    fn remove_entry(&mut self, entry: &Entry) -> Result<bool> {
+        let store = self.stores.entry(*entry.namespace_id()).or_default();
+        let entries = &mut store.entries;
 
         let del_index =
             entries
@@ -295,6 +309,200 @@ impl traits::EntryStorage for Rc<RefCell<EntryStore>> {
         let removed = del_index.map(|i| entries.remove(i));
 
         Ok(removed.is_some())
+    }
+}
+
+impl traits::EntryStorage for Rc<RefCell<EntryStore>> {
+    type Snapshot = Self;
+    type Reader = Self;
+
+    fn reader(&self) -> Self::Reader {
+        self.clone()
+    }
+
+    /// Removes the entry from the store.
+    fn remove_entry(&self, entry: &Entry) -> anyhow::Result<bool> {
+        let mut slf = self.borrow_mut();
+        Ok(slf.remove_entry(entry)?)
+    }
+
+    fn snapshot(&self) -> Result<Self::Snapshot> {
+        // This is quite ugly. But this is a quick memory impl only.
+        // But we should really maybe strive to not expose snapshots.
+        let stores = self
+            .borrow()
+            .stores
+            .iter()
+            .map(|(key, value)| {
+                (
+                    *key,
+                    NamespaceStore {
+                        entries: value.entries.clone(),
+                        events: Default::default(),
+                    },
+                )
+            })
+            .collect();
+        Ok(Rc::new(RefCell::new(EntryStore { stores })))
+    }
+
+    fn ingest_entry(&self, entry: &AuthorisedEntry, origin: EntryOrigin) -> Result<bool> {
+        let mut slf = self.borrow_mut();
+        slf.ingest_entry(entry, origin)
+    }
+
+    fn subscribe_area(
+        &self,
+        namespace: NamespaceId,
+        area: Area,
+        params: SubscribeParams,
+    ) -> impl Stream<Item = traits::StoreEvent> + Unpin + 'static {
+        let progress_id = self
+            .borrow_mut()
+            .stores
+            .entry(namespace)
+            .or_default()
+            .events
+            .next_progress_id();
+        EventStream {
+            area,
+            params,
+            namespace,
+            progress_id,
+            store: Rc::downgrade(self),
+        }
+    }
+
+    fn resume_subscription(
+        &self,
+        progress_id: u64,
+        namespace: NamespaceId,
+        area: Area,
+        params: SubscribeParams,
+    ) -> impl Stream<Item = traits::StoreEvent> + Unpin + 'static {
+        EventStream {
+            area,
+            params,
+            progress_id,
+            namespace,
+            store: Rc::downgrade(self),
+        }
+    }
+}
+
+/// Stream of events from a store subscription.
+///
+/// We have weak pointer to the entry store and thus the EventQueue.
+/// Once the store is dropped, the EventQueue wakes all streams a last time in its drop impl,
+/// which then makes the stream return none because Weak::upgrade returns None.
+#[derive(Debug)]
+struct EventStream {
+    progress_id: u64,
+    store: Weak<RefCell<EntryStore>>,
+    namespace: NamespaceId,
+    area: Area,
+    params: SubscribeParams,
+}
+
+impl Stream for EventStream {
+    type Item = StoreEvent;
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let Some(inner) = self.store.upgrade() else {
+            return Poll::Ready(None);
+        };
+        let mut inner_mut = inner.borrow_mut();
+        let store = inner_mut.stores.entry(self.namespace).or_default();
+        let res = ready!(store.events.poll_next(
+            self.progress_id,
+            |e| e.matches(self.namespace, &self.area, &self.params),
+            cx,
+        ));
+        drop(inner_mut);
+        drop(inner);
+        Poll::Ready(match res {
+            None => None,
+            Some((next_id, event)) => {
+                self.progress_id = next_id;
+                Some(event)
+            }
+        })
+    }
+}
+
+/// A simple in-memory event queue.
+///
+/// Events can be pushed, and get a unique monotonically-increasing *progress id*.
+/// Events can be polled, with a progress id to start at, and an optional filter function.
+///
+/// Current in-memory impl keeps all events, forever.
+// TODO: Add max_len constructor, add a way to truncate old entries.
+// TODO: This would be quite a bit more efficient if we filtered the waker with a closure
+// that is set from the last poll, to not wake everyone for each new event.
+#[derive(Debug)]
+struct EventQueue<T> {
+    events: VecDeque<T>,
+    offset: u64,
+    wakers: VecDeque<Waker>,
+}
+
+impl<T> Drop for EventQueue<T> {
+    fn drop(&mut self) {
+        for waker in self.wakers.drain(..) {
+            waker.wake()
+        }
+    }
+}
+
+impl<T> Default for EventQueue<T> {
+    fn default() -> Self {
+        Self {
+            events: Default::default(),
+            offset: 0,
+            wakers: Default::default(),
+        }
+    }
+}
+
+impl<T: Clone> EventQueue<T> {
+    fn insert(&mut self, f: impl FnOnce(u64) -> T) {
+        let progress_id = self.next_progress_id();
+        let event = f(progress_id);
+        self.events.push_back(event);
+        for waker in self.wakers.drain(..) {
+            waker.wake()
+        }
+    }
+
+    fn next_progress_id(&self) -> u64 {
+        self.offset + self.events.len() as u64
+    }
+
+    fn get(&self, progress_id: u64) -> Option<&T> {
+        let index = progress_id.checked_sub(self.offset)?;
+        self.events.get(index as usize)
+    }
+
+    fn poll_next(
+        &mut self,
+        progress_id: u64,
+        filter: impl Fn(&T) -> bool,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<(u64, T)>> {
+        if progress_id < self.offset {
+            return Poll::Ready(None);
+        }
+        let mut i = progress_id;
+        loop {
+            if let Some(event) = self.get(i) {
+                i += 1;
+                if filter(event) {
+                    break Poll::Ready(Some((i, event.clone())));
+                }
+            } else {
+                self.wakers.push_back(cx.waker().clone());
+                break Poll::Pending;
+            }
+        }
     }
 }
 

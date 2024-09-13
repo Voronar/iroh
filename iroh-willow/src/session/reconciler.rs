@@ -1,13 +1,10 @@
-use std::{
-    collections::{HashMap, HashSet},
-    num::NonZeroU64,
-};
+use std::collections::{HashMap, HashSet};
 
 use bytes::Bytes;
 use futures_lite::StreamExt;
 use genawaiter::rc::Co;
 use iroh_blobs::store::Store as PayloadStore;
-use tracing::{debug, trace};
+use tracing::debug;
 
 use crate::{
     proto::{
@@ -29,8 +26,7 @@ use crate::{
         Error, Role, SessionId,
     },
     store::{
-        entry::{EntryChannel, EntryOrigin},
-        traits::{EntryReader, EntryStorage, SplitAction, SplitOpts, Storage},
+        traits::{EntryOrigin, EntryReader, EntryStorage, SplitAction, SplitOpts, Storage},
         Store,
     },
     util::{
@@ -57,7 +53,7 @@ pub enum Output {
 pub struct Reconciler<S: Storage> {
     shared: Shared<S>,
     recv: Cancelable<MessageReceiver<ReconciliationMessage>>,
-    targets: TargetMap<S>,
+    targets: TargetMap,
     entry_state: EntryState,
 }
 
@@ -137,7 +133,7 @@ impl<S: Storage> Reconciler<S> {
             ReconciliationMessage::AnnounceEntries(message) => {
                 let target_id = message.handles();
                 self.entry_state
-                    .received_announce_entries(target_id, message.count)?;
+                    .received_announce_entries(target_id, message.is_empty)?;
                 let target = self
                     .targets
                     .get_eventually(&self.shared, &target_id)
@@ -164,12 +160,9 @@ impl<S: Storage> Reconciler<S> {
                     authorised_entry.entry().payload_length(),
                     message.entry.available,
                 )?;
-                self.shared.store.entries().ingest(
+                self.shared.store.entries().ingest_entry(
                     &authorised_entry,
-                    EntryOrigin::Remote {
-                        session: self.shared.session_id,
-                        channel: EntryChannel::Reconciliation,
-                    },
+                    EntryOrigin::Remote(self.shared.session_id),
                 )?;
             }
             ReconciliationMessage::SendPayload(message) => {
@@ -177,9 +170,11 @@ impl<S: Storage> Reconciler<S> {
                     .received_send_payload(self.shared.store.payloads(), message.bytes)
                     .await?;
             }
-            ReconciliationMessage::TerminatePayload(_message) => {
-                if let Some(completed_target) =
-                    self.entry_state.received_terminate_payload().await?
+            ReconciliationMessage::TerminatePayload(message) => {
+                if let Some(completed_target) = self
+                    .entry_state
+                    .received_terminate_payload(message.is_final)
+                    .await?
                 {
                     let target = self
                         .targets
@@ -224,30 +219,30 @@ impl<S: Storage> Reconciler<S> {
 }
 
 #[derive(Debug)]
-struct TargetMap<S: Storage> {
-    map: HashMap<TargetId, Target<S>>,
+struct TargetMap {
+    map: HashMap<TargetId, Target>,
     inbox: CancelableReceiver<Input>,
 }
 
-impl<S: Storage> TargetMap<S> {
+impl TargetMap {
     pub fn new(inbox: CancelableReceiver<Input>) -> Self {
         Self {
             map: Default::default(),
             inbox,
         }
     }
-    pub async fn get_eventually(
+    pub async fn get_eventually<S: Storage>(
         &mut self,
         shared: &Shared<S>,
         requested_id: &TargetId,
-    ) -> Result<&mut Target<S>, Error> {
+    ) -> Result<&mut Target, Error> {
         if !self.map.contains_key(requested_id) {
             self.wait_for_target(shared, requested_id).await?;
         }
         return Ok(self.map.get_mut(requested_id).unwrap());
     }
 
-    async fn wait_for_target(
+    async fn wait_for_target<S: Storage>(
         &mut self,
         shared: &Shared<S>,
         requested_id: &TargetId,
@@ -266,13 +261,12 @@ impl<S: Storage> TargetMap<S> {
         Ok(())
     }
 
-    async fn init_target(
+    async fn init_target<S: Storage>(
         &mut self,
         shared: &Shared<S>,
         intersection: AoiIntersection,
     ) -> Result<TargetId, Error> {
-        let snapshot = shared.store.entries().snapshot()?;
-        let target = Target::init(snapshot, shared, intersection).await?;
+        let target = Target::init(shared, intersection).await?;
         let id = target.id();
         debug!(
             our_handle = id.0.value(),
@@ -292,14 +286,17 @@ impl EntryState {
         self.0.is_none()
     }
 
-    pub fn received_announce_entries(&mut self, target: TargetId, count: u64) -> Result<(), Error> {
+    pub fn received_announce_entries(
+        &mut self,
+        target: TargetId,
+        is_empty: bool,
+    ) -> Result<(), Error> {
         if self.0.is_some() {
             return Err(Error::InvalidMessageInCurrentState);
         }
-        if let Some(count) = NonZeroU64::new(count) {
+        if !is_empty {
             self.0 = Some(EntryStateInner {
                 target,
-                remaining_entries: Some(count),
                 current_payload: CurrentPayload::default(),
             });
         }
@@ -314,10 +311,6 @@ impl EntryState {
     ) -> Result<(), Error> {
         let state = self.get_mut()?;
         state.current_payload.ensure_none()?;
-        state.remaining_entries = match state.remaining_entries.take() {
-            None => return Err(Error::InvalidMessageInCurrentState),
-            Some(c) => NonZeroU64::new(c.get().saturating_sub(1)),
-        };
         state.current_payload.set(
             payload_digest,
             total_payload_length,
@@ -339,10 +332,13 @@ impl EntryState {
         Ok(())
     }
 
-    pub async fn received_terminate_payload(&mut self) -> Result<Option<TargetId>, Error> {
+    pub async fn received_terminate_payload(
+        &mut self,
+        is_final: bool,
+    ) -> Result<Option<TargetId>, Error> {
         let state = self.get_mut()?;
         state.current_payload.finalize().await?;
-        if state.remaining_entries.is_none() {
+        if is_final {
             let target_id = state.target;
             self.0 = None;
             Ok(Some(target_id))
@@ -362,7 +358,6 @@ impl EntryState {
 #[derive(Debug)]
 struct EntryStateInner {
     target: TargetId,
-    remaining_entries: Option<NonZeroU64>,
     current_payload: CurrentPayload,
 }
 
@@ -379,29 +374,23 @@ struct Shared<S: Storage> {
 }
 
 #[derive(Debug)]
-struct Target<S: Storage> {
-    snapshot: <S::Entries as EntryStorage>::Snapshot,
-
+struct Target {
     intersection: AoiIntersection,
-
     our_uncovered_ranges: HashSet<u64>,
     started: bool,
-
     our_range_counter: u64,
     their_range_counter: u64,
 }
 
-impl<S: Storage> Target<S> {
+impl Target {
     fn id(&self) -> TargetId {
         self.intersection.id()
     }
-    async fn init(
-        snapshot: <S::Entries as EntryStorage>::Snapshot,
+    async fn init<S: Storage>(
         shared: &Shared<S>,
         intersection: AoiIntersection,
     ) -> Result<Self, Error> {
         let mut this = Target {
-            snapshot,
             intersection,
             our_uncovered_ranges: Default::default(),
             started: false,
@@ -418,9 +407,12 @@ impl<S: Storage> Target<S> {
         self.intersection.namespace
     }
 
-    async fn initiate(&mut self, shared: &Shared<S>) -> Result<(), Error> {
+    async fn initiate<S: Storage>(&mut self, shared: &Shared<S>) -> Result<(), Error> {
         let range = self.intersection.area().to_range();
-        let fingerprint = self.snapshot.fingerprint(self.namespace(), &range)?;
+        let fingerprint = shared
+            .store
+            .entries()
+            .fingerprint(self.namespace(), &range)?;
         self.send_fingerprint(shared, range, fingerprint, None)
             .await?;
         Ok(())
@@ -430,7 +422,7 @@ impl<S: Storage> Target<S> {
         self.started && self.our_uncovered_ranges.is_empty()
     }
 
-    async fn received_send_fingerprint(
+    async fn received_send_fingerprint<S: Storage>(
         &mut self,
         shared: &Shared<S>,
         message: ReconciliationSendFingerprint,
@@ -441,35 +433,28 @@ impl<S: Storage> Target<S> {
         }
         let range_count = self.next_range_count_theirs();
 
-        let our_fingerprint = self
-            .snapshot
+        let our_fingerprint = shared
+            .store
+            .entries()
             .fingerprint(self.namespace(), &message.range)?;
 
         // case 1: fingerprint match.
         if our_fingerprint == message.fingerprint {
-            let reply = ReconciliationAnnounceEntries {
-                range: message.range.clone(),
-                count: 0,
-                want_response: false,
-                will_sort: false,
-                sender_handle: message.receiver_handle,
-                receiver_handle: message.sender_handle,
-                covers: Some(range_count),
-            };
-            shared.send.send(reply).await?;
+            self.announce_and_send_entries(shared, &message.range, false, Some(range_count), true)
+                .await?;
         }
         // case 2: fingerprint is empty
         else if message.fingerprint.is_empty() {
-            self.announce_and_send_entries(shared, &message.range, true, Some(range_count), None)
+            self.announce_and_send_entries(shared, &message.range, true, Some(range_count), false)
                 .await?;
         }
         // case 3: fingerprint doesn't match and is non-empty
         else {
             // reply by splitting the range into parts unless it is very short
-            // TODO: Expose
+            // TODO: Expose these options to a higher level.
             let split_opts = SplitOpts::default();
-            let snapshot = self.snapshot.clone();
-            let mut iter = snapshot
+            let store = shared.store.entries().clone();
+            let mut iter = store
                 .split_range(self.namespace(), &message.range, &split_opts)?
                 .peekable();
             while let Some(res) = iter.next() {
@@ -478,14 +463,8 @@ impl<S: Storage> Target<S> {
                 let covers = is_last.then_some(range_count);
                 match action {
                     SplitAction::SendEntries(count) => {
-                        self.announce_and_send_entries(
-                            shared,
-                            &subrange,
-                            true,
-                            covers,
-                            Some(count),
-                        )
-                        .await?;
+                        self.announce_and_send_entries(shared, &subrange, true, covers, count == 0)
+                            .await?;
                     }
                     SplitAction::SendFingerprint(fingerprint) => {
                         self.send_fingerprint(shared, subrange, fingerprint, covers)
@@ -498,12 +477,11 @@ impl<S: Storage> Target<S> {
         Ok(())
     }
 
-    async fn received_announce_entries(
+    async fn received_announce_entries<S: Storage>(
         &mut self,
         shared: &Shared<S>,
         message: ReconciliationAnnounceEntries,
     ) -> Result<(), Error> {
-        trace!(?message, "received_announce_entries start");
         self.started = true;
         if let Some(range_count) = message.covers {
             self.mark_our_range_covered(range_count)?;
@@ -511,14 +489,13 @@ impl<S: Storage> Target<S> {
 
         if message.want_response {
             let range_count = self.next_range_count_theirs();
-            self.announce_and_send_entries(shared, &message.range, false, Some(range_count), None)
+            self.announce_and_send_entries(shared, &message.range, false, Some(range_count), false)
                 .await?;
         }
-        trace!("received_announce_entries done");
         Ok(())
     }
 
-    async fn send_fingerprint(
+    async fn send_fingerprint<S: Storage>(
         &mut self,
         shared: &Shared<S>,
         range: Range3d,
@@ -537,36 +514,57 @@ impl<S: Storage> Target<S> {
         Ok(())
     }
 
-    async fn announce_and_send_entries(
+    /// Send a [`ReconciliationAnnounceEntries`] message for a range, and all entries in the range unless
+    /// `is_empty` is set to true.
+    async fn announce_and_send_entries<S: Storage>(
         &mut self,
         shared: &Shared<S>,
         range: &Range3d,
         want_response: bool,
         covers: Option<u64>,
-        our_entry_count: Option<u64>,
+        is_empty: bool,
     ) -> Result<(), Error> {
-        let our_entry_count = match our_entry_count {
-            Some(count) => count,
-            None => self.snapshot.count(self.namespace(), range)?,
+        if want_response {
+            self.mark_our_next_range_pending();
+        }
+
+        // If we know for sure that our range is empty, we can skip creating the entry iterator alltogether.
+        let mut iter = if is_empty {
+            None
+        } else {
+            Some(
+                shared
+                    .store
+                    .entries()
+                    .get_authorised_entries(self.namespace(), range)
+                    .peekable(),
+            )
         };
+        // Find out if we will send any entries at all.
+        let is_empty = iter
+            .as_mut()
+            .map(|iter| iter.peek().is_none())
+            .unwrap_or(true);
+
+        // Send the announce message
         let msg = ReconciliationAnnounceEntries {
             range: range.clone().into(),
-            count: our_entry_count,
+            is_empty,
             want_response,
             will_sort: false, // todo: sorted?
             sender_handle: self.intersection.our_handle,
             receiver_handle: self.intersection.their_handle,
             covers,
         };
-        if want_response {
-            self.mark_our_next_range_pending();
-        }
         shared.send.send(msg).await?;
 
-        for authorised_entry in self
-            .snapshot
-            .get_authorised_entries(self.namespace(), range)
-        {
+        // If our range is empty, we're done!
+        let Some(mut iter) = iter else {
+            return Ok(());
+        };
+
+        // Otherwise send all the entries in our iterator, and payloads if applicable.
+        while let Some(authorised_entry) = iter.next() {
             let authorised_entry = authorised_entry?;
             let (entry, token) = authorised_entry.into_parts();
 
@@ -594,7 +592,11 @@ impl<S: Storage> Target<S> {
                 })
                 .await?;
             }
-            shared.send.send(ReconciliationTerminatePayload).await?;
+            let is_final = iter.peek().is_none();
+            shared
+                .send
+                .send(ReconciliationTerminatePayload { is_final })
+                .await?;
         }
         Ok(())
     }
